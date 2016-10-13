@@ -1,0 +1,1267 @@
+###############
+# Flow of logs
+###############
+#Account_id -> user_id -> session_id -> parent_id
+
+DROP DATABASE sandbox_prod;
+CREATE DATABASE sandbox_prod;
+use sandbox_prod;
+
+################################################################
+#
+# FILTERS
+# 1) type = 'PlaybackActivity' ... make sure they pressed something
+# 2) video_state != 0 ... 
+#		[guidespark2_prod.activities.is_preview = 'active' and guidespark2_prod.videos.state = 'published'] 
+#		OR
+#		[guidespark2_prod.videos.g1_video = 1 and guidespark2_prod.activities.is_preview = 'active' and guidespark2_prod.videos.state = 'closed']
+#
+# All Tables except TMP_REACH 
+# 3) client_created_at IS NOT NULL .. takes out all g1_ids + g1_aicc_activity actions
+# 4) g1_id IS NULL (duplicate from client_created_at)
+#
+################################################################
+
+################################################################
+# Created by DKJ 8/5/14
+#
+# User_ids
+# This contains the queries that looks at the total # of single 
+# playbackactivity user_ids ... (i.e. most are g1 data)
+#
+# Filters
+# 1) type = 'PlaybackActivity'
+# 2) video_state != 0
+# 3) client_created_at IS NOT NULL
+# 4) g1_id IS NULL
+#
+################################################################
+
+##############################################
+# CREATE SFDC list 
+# HEX gives the diff between upper/lower case
+##############################################
+CREATE TABLE sandbox_prod.TMP_SFDC_GROUP
+	SELECT LEFT(sfdc,15) as sfdc,name,id as account_id,
+		COUNT(distinct id) as Naccount 
+	FROM 
+		guidespark2_prod.accounts 
+	GROUP BY id
+	UNION
+	SELECT LEFT(sfdc,15),GROUP_CONCAT(name) as name,
+		GROUP_CONCAT(id ORDER BY id) as account_id,
+		COUNT(distinct id) as Naccount 
+	FROM 
+		guidespark2_prod.accounts 
+	WHERE sfdc IS NOT NULL 
+	GROUP BY HEX(LEFT(sfdc,15));
+CREATE INDEX Isfdc ON TMP_SFDC_GROUP (sfdc);
+
+############################################################################
+##################### Lookup for tmp/demo accounts #########################
+############################################################################
+CREATE TABLE sandbox_prod.TMP_TEMP_ACCOUNTS
+select id,name as account_name FROM guidespark2_prod.accounts where id IN 
+	(select id from guidespark2_prod.accounts WHERE 
+		UPPER(name) LIKE '%%TEST%%' 
+		OR UPPER(name) LIKE '%%TEZT%%' 
+		OR UPPER(name) = 'MONITOR' 
+		OR UPPER(name) LIKE '%%TEMP%%' 
+		OR UPPER(name) = 'ACME' 
+		OR UPPER(name) LIKE '%%DEMO%%') 
+	OR id IN (1,233,348,389,455,461,466,534,694,783,784,
+			  828,842,843,914,940,989,998,1013,1021,1022,
+			  1060,1070,1074,1078,1085,1102,1241,1251,1261,
+			  1271,663,882,2331,839,1115,1491,1511,1641,2221,3261);
+CREATE INDEX Iaccount on sandbox_prod.TMP_TEMP_ACCOUNTS (id);
+
+############################################################
+##################### REACH SCORES #########################
+############################################################
+### 5 min ... gives data until 8am UTC on current day
+CREATE TABLE sandbox_prod.TMP_REACH_ALL (
+    SELECT * FROM (
+        SELECT A.user_id,A.session_id,A.parent_id,min(A.created_at) as min_time,max(A.created_at) as max_time,
+                A.trackable_id,C.title as video_title,D.name as video_category,
+                A.account_id,B.name as account_name,B.subdomain,E.name as industry_name, B.benefits_eligible_employees as BEEs,
+                IF(F.target_audience IS NULL,B.benefits_eligible_employees,IF(F.target_audience = 0,
+                B.benefits_eligible_employees,F.target_audience)) as target_audience,
+                LEFT(B.sfdc,15) as sfdc,A.g1_id
+            FROM guidespark2_prod.activities A
+            LEFT JOIN guidespark2_prod.accounts B ON A.account_id=B.id
+            LEFT JOIN guidespark2_prod.videos C ON A.trackable_id=C.id
+            LEFT JOIN guidespark2_prod.categories D ON C.category_id=D.id
+            LEFT JOIN guidespark2_prod.industries E ON B.industry_id=E.id
+            LEFT JOIN (SELECT account_id,contentable_id as video_id,
+                              benefits_eligible_employees as target_audience
+                              FROM guidespark2_prod.account_contents
+                              WHERE contentable_type IN ('Video')
+                              AND benefits_eligible_employees IS NOT NULL) F ON A.account_id = F.account_id AND A.trackable_id=F.video_id
+            WHERE A.is_preview = 'active'
+                AND A.`type` IN ('PlaybackActivity')
+                AND A.client_action IN ('_PLAY')
+                AND A.parent_id IS NOT NULL
+            GROUP BY A.user_id,A.parent_id) T
+            WHERE max_time < DATE_ADD(CAST(NOW() as DATE),INTERVAL 7 hour)
+            AND account_id NOT IN (select id from sandbox_prod.TMP_TEMP_ACCOUNTS) );
+
+CREATE INDEX Iaccount_id ON sandbox_prod.TMP_REACH_ALL (account_id);
+CREATE INDEX Itrackable_id ON sandbox_prod.TMP_REACH_ALL (trackable_id);
+CREATE INDEX Iparent_id ON sandbox_prod.TMP_REACH_ALL (parent_id);
+CREATE INDEX Ivideo_category ON sandbox_prod.TMP_REACH_ALL (video_category);
+CREATE INDEX Iindustry_name ON sandbox_prod.TMP_REACH_ALL (industry_name);
+CREATE INDEX Isfdc ON sandbox_prod.TMP_REACH_ALL (sfdc);
+
+
+#### Proxy for reach test ####
+CREATE TABLE sandbox_prod.TMP_PARENT_PLAYBACK_ENDED (
+		SELECT parent_id FROM sandbox_prod.TMP_REACH_ALL where parent_id IN 
+			(SELECT distinct parent_id FROM guidespark2_prod.activities WHERE client_action IN ('_PLAYBACK_ENDED') and parent_id IS NOT NULL)
+		);	
+			
+#################################################################################################
+# Create custom video_duration table
+# Duration GROUPED on video_version_id,video_id & based off of starts_at+duration of final slide 
+#################################################################################################
+CREATE TABLE sandbox_prod.TMP_VIDEO_DURATION
+SELECT A.*,B.starts_at,B.duration,B.starts_at+B.duration as video_duration FROM 
+(select T.video_version_id,T.video_id,TT.title,TTT.name as video_category,CONCAT(',',GROUP_CONCAT(T.id),',') as slide_list,MAX(T.id) as final_slide_global,MAX(T.slide_number) as Nslide_total 
+FROM guidespark2_prod.video_slides T 
+INNER JOIN guidespark2_prod.videos TT ON T.video_id = TT.id 
+LEFT JOIN guidespark2_prod.categories TTT ON TT.category_id=TTT.id
+GROUP BY video_version_id,video_id) A 
+INNER JOIN guidespark2_prod.video_slides B ON A.Nslide_total=B.slide_number AND A.video_version_id=B.video_version_id;
+
+###########################################
+# Find which parent_ids are mobile
+###########################################
+CREATE TABLE sandbox_prod.TMP_PARENT_MOBILE (
+	SELECT A.parent_id,A.session_id,B.is_mobile FROM (
+		SELECT parent_id,session_id from guidespark2_prod.activities 
+					WHERE parent_id IS NOT NULL 
+					AND type IN ("PlaybackActivity") 
+					AND client_action IN ('_PLAY')
+					AND is_preview = 'active' 
+		GROUP BY parent_id) A
+		LEFT JOIN 
+			guidespark2_prod.sessions B 
+		ON A.session_id=B.id
+);
+CREATE INDEX Iparent_id ON sandbox_prod.TMP_PARENT_MOBILE (parent_id);
+CREATE INDEX Isession_id on sandbox_prod.TMP_PARENT_MOBILE (session_id);
+
+CREATE TABLE sandbox_prod.TMP_ACCOUNT_PARENT_MOBILE (
+	SELECT account_id,trackable_id,COUNT(parent_id) as Nparent_pen,SUM(is_mobile) as Nparent_pen_mobile FROM (
+	SELECT A.account_id,A.trackable_id,A.parent_id,A.session_id,B.is_mobile FROM (
+		SELECT account_id,trackable_id,parent_id,session_id from guidespark2_prod.activities 
+					WHERE parent_id IS NOT NULL 
+					AND type IN ("PlaybackActivity") 
+					AND client_action IN ('_PLAY')
+					AND is_preview = 'active' 
+		GROUP BY account_id,trackable_id,parent_id) A
+		LEFT JOIN 
+			guidespark2_prod.sessions B 
+		ON A.session_id=B.id) T
+		GROUP BY account_id,trackable_id
+);
+CREATE INDEX Iaccount_id ON sandbox_prod.TMP_ACCOUNT_PARENT_MOBILE (account_id);
+CREATE INDEX Itrackable_id on sandbox_prod.TMP_ACCOUNT_PARENT_MOBILE (trackable_id);
+
+################################################################
+################  Activity Metric #9 and #5 ####################
+################################################################
+# Slides Viewed AND Completion Rate
+#########################################################
+CREATE TABLE sandbox_prod.TMP_NSLIDE (select A.id,A.title,A.duration,B.Nslide from guidespark2_prod.videos A LEFT JOIN (select video_id,COUNT(video_id) as Nslide from guidespark2_prod.video_slides GROUP BY video_id) B ON A.id=B.video_id);
+
+########################################################################################################################
+# Latest Slide Query ... does not account for '_PAUSE' and return to '_PLAY' ... in this case, slide would double count
+#
+# TMP_RELATIVE_VIEW .. aggregate views per slide ... parent_id is not taken into account
+# trackable_id -> current video_id
+# slide_id -> slide_id = guidespark2_prod.video_slides.id
+# slide_number -> slide # within the overall video = guidespark2_prod.video_slides.slide_number
+# Nview -> total views of the slide (can have multiple views per parent id)
+# Nview1 -> total views of the first slide
+# relative_view -> Nview / Nview_slide1
+# title -> slide title
+#
+# TMP_NSLIDE_VIEW
+# video_title <- title of video
+# video_category <- type of video
+# parent_id <- unique view identifier
+# trackable_id <- video_id
+# slide_id <- unique identifier for the slide
+# Nslide_view_total <- total # of slides viewed
+# Nslide_total <- total # of slides in the video
+# slide_view_percentage <- Nslide_view_total/Nslide_total (% of total slides viewed)
+# client_action <- GROUP_CONCAT of all actions that signify a new slide
+#
+# TMP_NSLIDE_VIEW_GLOBAL
+# parent_id <- unique view identifier
+# trackable_id <- video_id
+# Nslide_view_distinct <- Number of distinct slides viewed
+# Nslide_missed <- Number of distinct slides NOT viewed
+# global_slide_view_percentage <- Nslide_view_total / Nslide_total
+#
+# TMP_COMPLETION_RATE
+# parent_id <- unique view identifier
+# video_title <- title of video
+# video_category <- type of video
+# parent_complete0 <- # of parent_ids that viewed ALL slides
+# parent_complete1 <- # of parent_ids that viewed ALL BUT 1 slide
+# parent_complete2 <- # of parent_ids that viewed ALL BUT 2 slides
+# parent_complete_1only <- # of parent_ids that viewed ONLY 1 slide
+# Nparent_total <- # of distinct parent_ids per video_title/trackable_id
+# completion_rateALL <- parent_complete0/Nparent_total .... completion rate for parent_ids that viewed ALL Slides
+# completion_rateALL_but1 <- parent_complete1/Nparent_total .... completion rate for parent_ids that viewed ALL BUT 1 Slide
+# completion_rateALL_but2 <- parent_complete2/Nparent_total .... completion rate for parent_ids that viewed ALL BUT 2 Slides
+# completion_rateNONE <- parent_completeNONE/Nparent_total .... completion rate for parent_ids that viewed NO SLIDES
+########################################################################################################################
+
+CREATE TABLE sandbox_prod.TMP_RELATIVE_VIEW (
+SELECT T.trackable_id,T.video_version_id,T.slide_id,T.slide_number,T.Nview,TT.Nview_slide1,T.Nview/TT.Nview_slide1 as relative_view,T.title from 
+(SELECT trackable_id,B.video_version_id,slide_id, B.slide_number,count(slide_id) as Nview, B.title FROM guidespark2_prod.activities A INNER JOIN guidespark2_prod.video_slides B ON A.slide_id = B.id 
+WHERE type IN ('PlaybackActivity') 
+AND A.`is_preview` = 'active' 
+AND (client_action IN ('_PLAY', '_AUTO_NEXT_SLIDE') OR (client_action = '_PROGRESS_BAR_CHANGE' AND ( old_value < B.starts_at OR old_value > (B.starts_at + B.duration)))) 
+GROUP BY trackable_id,slide_id ORDER BY trackable_id,B.starts_at ASC) T
+LEFT JOIN
+(SELECT trackable_id,B.video_version_id,slide_id, B.slide_number,count(slide_id) as Nview_slide1 FROM guidespark2_prod.activities A INNER JOIN guidespark2_prod.video_slides B ON A.slide_id = B.id 
+WHERE type IN ('PlaybackActivity') 
+AND A.`is_preview` = 'active' 
+AND (client_action IN ('_PLAY', '_AUTO_NEXT_SLIDE') OR (client_action = '_PROGRESS_BAR_CHANGE' AND ( old_value < B.starts_at OR old_value > (B.starts_at + B.duration))))
+AND B.slide_number = 1 
+GROUP BY trackable_id,slide_id ORDER BY trackable_id,B.starts_at ASC) TT
+ON T.trackable_id=TT.trackable_id AND T.video_version_id=TT.video_version_id);
+
+##################################################################################################################
+# Find all pause guidespark2_prod.activities with the play after
+# These will be removed from TMP_NSLIDE_VIEW ... these are not chapter views, they are continuation after pauses
+# 
+# SELECT * FROM TMP_PAUSE_ID WHERE client_action IN ('_PLAY') GROUP BY Bid HAVING id-Bid = MIN(id_diff)
+# This assumes that the 1st Play after Pause should be removed for the same parent_id
+##################################################################################################################
+CREATE TABLE sandbox_prod.TMP_A (SELECT id,parent_id,trackable_id as video_id,video_version_id,client_action,old_value,new_value,slide_id
+		FROM guidespark2_prod.activities WHERE parent_id IN (SELECT distinct parent_id FROM guidespark2_prod.activities WHERE client_action IN ('_PAUSE') AND parent_id IN (select distinct parent_id FROM sandbox_prod.TMP_REACH_ALL)));
+CREATE INDEX Iparent_id ON sandbox_prod.TMP_A (parent_id);		
+
+CREATE TABLE sandbox_prod.TMP_B (SELECT id,parent_id FROM guidespark2_prod.activities WHERE client_action IN ('_PAUSE') AND parent_id IN (select distinct parent_id FROM sandbox_prod.TMP_REACH_ALL) ORDER BY id);
+CREATE INDEX Iparent_id ON sandbox_prod.TMP_B (parent_id);	
+
+CREATE TABLE sandbox_prod.TMP_PAUSE_ID (
+SELECT (A.id-B.id) as id_diff,B.id As Bid,A.* 
+	FROM 
+		sandbox_prod.TMP_A A
+	INNER JOIN 
+		sandbox_prod.TMP_B B
+	ON A.parent_id=B.parent_id WHERE A.id > B.id);
+CREATE INDEX Iid ON sandbox_prod.TMP_PAUSE_ID (Bid);
+
+CREATE TABLE sandbox_prod.TMP_EXTRA_VIEW (SELECT A.parent_id,A.video_version_id,A.video_id,A.slide_id,COUNT(A.Bid) as Nextra_view 
+					FROM (SELECT * FROM TMP_PAUSE_ID WHERE client_action IN ('_PLAY') GROUP BY Bid HAVING id-Bid = MIN(id_diff)) A 
+					GROUP BY parent_id,slide_id);
+CREATE INDEX Iparent_id ON sandbox_prod.TMP_EXTRA_VIEW (parent_id);	
+	
+CREATE TABLE sandbox_prod.TMP_NSLIDE_VIEW (
+	SELECT C.title as video_title,E.name as video_category,T.*,D.slide_number,D.starts_at,D.duration as slide_duration,(D.starts_at + D.duration) as viewing_end_time from
+	(SELECT AA.parent_id,BB.video_version_id,AA.trackable_id as video_id,BB.duration,AA.slide_id,AA.Nfocus,
+			AA.Nslide_view_total-IFNULL(CC.Nextra_view,0) as Nslide_view_total,BB.Nslide_total,
+			(AA.Nslide_view_total-IFNULL(CC.Nextra_view,0))/BB.Nslide_total as slide_view_percentage,
+			IFNULL(CC.Nextra_view,0) as Nextra_view
+	FROM
+	(SELECT parent_id,trackable_id,slide_id,COUNT(slide_id) as Nslide_view_total,SUM(focus) as Nfocus,GROUP_CONCAT(client_action) as client_action 
+		FROM guidespark2_prod.activities G INNER JOIN guidespark2_prod.video_slides H ON G.slide_id=H.id
+		WHERE type IN ("PlaybackActivity") AND is_preview IN ('active') AND account_id IS NOT NULL 
+		AND client_created_at IS NOT NULL AND parent_id IS NOT NULL 
+		AND (client_action IN ('_PLAY') OR (client_action = '_PROGRESS_BAR_CHANGE' AND ( old_value < H.starts_at OR old_value > (H.starts_at + H.duration))) # Progress bar to new slide
+			OR (client_action IN ('_AUTO_NEXT_SLIDE') AND (old_value < new_value) ) )  # old_value > new_value means it is done and returns to the first slide .. DO NOT COUNT
+		GROUP BY parent_id,slide_id) AA
+	LEFT JOIN 
+		(select A.video_version_id,A.video_id,B.title,A.id as slide_id,C.final_slide_global,C.Nslide_total,D.duration 
+			FROM guidespark2_prod.video_slides A 
+			INNER JOIN guidespark2_prod.videos B ON A.video_id = B.id
+			INNER JOIN (select video_version_id,video_id,MIN(distinct id) as first_slide_global,MAX(distinct id) as final_slide_global,
+				COUNT(distinct id) as Nslide_total FROM guidespark2_prod.video_slides GROUP BY video_version_id,video_id) C 
+				ON A.video_version_id = C.video_version_id 
+				INNER JOIN guidespark2_prod.video_versions D ON A.video_version_id=D.id AND A.video_id=D.video_id GROUP BY A.video_version_id,A.video_id,A.id) BB
+	ON AA.slide_id=BB.slide_id
+	LEFT JOIN sandbox_prod.TMP_EXTRA_VIEW CC ON AA.parent_id=CC.parent_id AND AA.slide_id=CC.slide_id
+	GROUP BY AA.parent_id,AA.slide_id) T 
+	LEFT JOIN guidespark2_prod.videos C ON T.video_id=C.id 
+	LEFT JOIN guidespark2_prod.video_slides D ON T.slide_id=D.id
+	LEFT JOIN guidespark2_prod.categories E ON C.category_id=E.id);
+
+CREATE TABLE sandbox_prod.TMP_NSLIDE_VIEW_GLOBAL (
+	SELECT A.*,IFNULL(B.Nplayback_ended,0) as Nplayback_ended FROM
+	(select parent_id,video_version_id,video_id,video_title,video_category,duration,COUNT(distinct slide_id) as Nslide_view_distinct,Nslide_total - COUNT(distinct slide_id) as Nslide_missed,
+		SUM(Nslide_view_total) as Nslide_view_total,Nslide_total,
+		SUM(Nslide_view_total)/AVG(Nslide_total) as global_slide_view_percentage,
+		COUNT(distinct slide_id)/Nslide_total as global_slide_view_percentage_distinct,
+		SUM(Nfocus) as Nfocus,
+		MAX(slide_number) as max_viewed_slide,MAX(viewing_end_time) as viewing_end_time 
+	FROM 
+		sandbox_prod.TMP_NSLIDE_VIEW 
+	GROUP BY parent_id,video_id) A
+	LEFT JOIN
+	(SELECT parent_id, COUNT(client_action) as Nplayback_ended FROM guidespark2_prod.activities 
+		WHERE type IN ("PlaybackActivity") AND is_preview IN ('active') AND account_id IS NOT NULL
+		AND client_created_at IS NOT NULL AND parent_id IS NOT NULL AND client_action IN ('_PLAYBACK_ENDED') GROUP BY parent_id) B
+	ON A.parent_id=B.parent_id);
+CREATE INDEX Iparent_id ON sandbox_prod.TMP_NSLIDE_VIEW_GLOBAL (parent_id);
+CREATE INDEX Ivideo_id ON sandbox_prod.TMP_NSLIDE_VIEW_GLOBAL (video_id);
+CREATE INDEX Ivideo_version_id ON sandbox_prod.TMP_NSLIDE_VIEW_GLOBAL (video_version_id);
+
+
+### COMPLETION RATE ... defined as any video where the user watched ALL slides
+CREATE TABLE sandbox_prod.TMP_COMPLETION_RATE (
+	SELECT B.account_id,B.account_name,B.industry_name,B.BEEs,B.video_id,B.video_version_id,
+				B.video_title,B.video_category,B.duration,B.Nslide_total,B.Nfocus,
+				IFNULL(TTT.parent_completeALL,0) as parent_completeALL,
+				IFNULL(TTT.parent_completeALL_but1,0) as parent_completeALL_but1,
+				IFNULL(TTT.parent_completeALL_but2,0) as parent_completeALL_but2,
+				IFNULL(TTT.parent_completeNONE,0) as parent_completeNONE,
+				B.Nparent as Nparent_total,
+				IFNULL(TTT.parent_completeALL,0)/Nparent as completion_rateALL,
+				IFNULL(TTT.parent_completeALL_but1,0)/Nparent as completion_rateALL_but1,
+				IFNULL(TTT.parent_completeALL_but2,0)/Nparent as completion_rateALL_but2,
+				IFNULL(TTT.parent_completeNONE,0)/Nparent as completion_rateNONE,
+				B.sfdc
+		FROM (SELECT TT.*,A3.Nparent as parent_completeNONE FROM
+			
+			(SELECT T.*,A2.Nparent as parent_completeALL_but2 FROM
+				
+				(SELECT A0.video_id,A0.video_version_id,A0.video_title,A0.video_category,A0.duration,
+						A0.Nparent as parent_completeALL,A1.Nparent as parent_completeALL_but1 FROM
+					(SELECT video_id,video_version_id,video_title,video_category,duration,
+							COUNT(distinct parent_id) as Nparent from TMP_NSLIDE_VIEW_GLOBAL WHERE Nslide_missed = 0 GROUP BY video_id,video_version_id) A0
+					LEFT JOIN
+					(SELECT video_id,video_version_id,duration,COUNT(distinct parent_id) as Nparent from TMP_NSLIDE_VIEW_GLOBAL 
+							WHERE Nslide_missed <= 1 GROUP BY video_id,video_version_id) A1
+					ON
+					A0.video_id=A1.video_id AND A0.video_version_id=A1.video_version_id) T 
+						
+						LEFT JOIN
+						(SELECT video_id,video_version_id,duration,
+								COUNT(distinct parent_id) as Nparent from TMP_NSLIDE_VIEW_GLOBAL WHERE Nslide_missed <= 2 GROUP BY video_id,video_version_id) A2
+						ON 
+						T.video_id=A2.video_id AND T.video_version_id=A2.video_version_id) TT
+							
+							LEFT JOIN
+							(SELECT video_id,video_version_id,duration,
+									COUNT(distinct parent_id) as Nparent from TMP_NSLIDE_VIEW_GLOBAL WHERE Nslide_missed = Nslide_total GROUP BY video_id,video_version_id) A3
+							ON 
+							TT.video_id=A3.video_id AND TT.video_version_id=A3.video_version_id) TTT
+								
+								RIGHT JOIN
+								(SELECT A.*,AA.account_id,AA.account_name,AA.industry_name,AA.sfdc,AA.BEEs FROM
+									(SELECT video_id,video_version_id,video_title,video_category,duration,Nslide_total,Nfocus,
+										COUNT(distinct parent_id) as Nparent FROM TMP_NSLIDE_VIEW_GLOBAL GROUP BY video_id,video_version_id) A 
+									LEFT JOIN sandbox_prod.TMP_REACH_ALL AA ON A.video_id=AA.trackable_id
+								) B
+								ON
+								TTT.video_id=B.video_id AND TTT.video_version_id=B.video_version_id  ); 
+
+CREATE INDEX Ivideo_id ON sandbox_prod.TMP_COMPLETION_RATE (video_id);
+CREATE INDEX Ivideo_version_id ON sandbox_prod.TMP_COMPLETION_RATE (video_version_id);
+								
+########################################################
+# Finds the final slide watched ... MAX(guidespark2_prod.activities.id)
+########################################################
+CREATE TABLE sandbox_prod.TMP_DROP_SLIDE (
+	SELECT A.parent_id,A.account_id,C.name as account_name,C.industry_id,D.name as industry_name,E.title as video_title,F.title as slide_title,
+		G.name as video_category,B.video_version_id,A.trackable_id as video_id,B.Ncnt,A.slide_id as drop_slide,F.slide_number,C.sfdc,C.product_line from guidespark2_prod.activities A 
+		RIGHT JOIN 
+		(SELECT parent_id,H.video_version_id,trackable_id,COUNT(G.id) as Ncnt,MAX(G.id) as MAXid FROM guidespark2_prod.activities G INNER JOIN guidespark2_prod.video_slides H ON G.slide_id=H.id
+			WHERE type IN ("PlaybackActivity") AND is_preview IN ('active') AND account_id IS NOT NULL 
+			AND client_created_at IS NOT NULL AND parent_id IS NOT NULL 
+			AND (client_action IN ('_PLAY') OR (client_action = '_PROGRESS_BAR_CHANGE' AND ( old_value < H.starts_at OR old_value > (H.starts_at + H.duration))) 
+			OR (client_action IN ('_AUTO_NEXT_SLIDE') AND (old_value < new_value) ) )
+	    GROUP BY parent_id,trackable_id) B ON A.id=B.MAXid 
+	    LEFT JOIN guidespark2_prod.accounts C ON A.account_id=C.id 
+	    LEFT JOIN guidespark2_prod.industries D ON C.industry_id=D.id 
+	    LEFT JOIN guidespark2_prod.videos E on A.trackable_id=E.id 
+	    LEFT JOIN guidespark2_prod.video_slides F ON A.slide_id=F.id
+	    LEFT JOIN guidespark2_prod.categories G ON E.category_id=G.id);
+	   
+CREATE TABLE sandbox_prod.TMP_DROP_SLIDE_DETAIL (
+		SELECT A.*,B.Nslide_view_distinct,B.Nslide_total,B.Nslide_missed,B.Nfocus,C.max_slide_id 
+		FROM 
+			sandbox_prod.TMP_DROP_SLIDE A 
+		INNER JOIN 
+			sandbox_prod.TMP_NSLIDE_VIEW_GLOBAL B 
+			ON A.parent_id=B.parent_id AND A.video_version_id=B.video_version_id 
+		INNER JOIN 
+			(SELECT video_version_id,MAX(id) as max_slide_id FROM guidespark2_prod.video_slides GROUP BY video_version_id) C 
+		ON A.video_version_id=C.video_version_id);
+
+CREATE INDEX Iparent_id ON sandbox_prod.TMP_DROP_SLIDE_DETAIL (parent_id);
+CREATE INDEX Ivideo_id ON sandbox_prod.TMP_DROP_SLIDE_DETAIL (video_id);
+CREATE INDEX Ivideo_version_id ON sandbox_prod.TMP_DROP_SLIDE_DETAIL (video_version_id);
+	
+################################################################
+################  Activity Metric #2 and #6 ####################
+################################################################
+# Median View Time / # of user clicks
+#
+# video_title <- title of video
+# video_category <- type of video
+# video_id <- unique id of video (trackable_id from guidespark2_prod.activities table)
+# parent_id <- unique view identifier
+# Nrecord <- Total number of views
+# Nvideo <- number of guidespark2_prod.videos within the query (should always be 1)
+# is_mobile <- 0 .. desktop, 1 ... mobile
+# Nbuffer <- # of buffer events within parent_id
+# Nclick <- # of user clicks within parent_id
+# min_time <- minimum record time within parent_id
+# max_time <- maximum record time within parent_id
+# viewing_time <- max_time-min_time
+# duration <- total length of video
+# SUM(buffer)/3 ... divide by 3 b/c each event has _VIDEO_BUFFERING, _VIDEO_BUFFERING_DONE, _PLAYBACK_CONTINUE
+#
+# **** NOTE ****
+# Will have less records than TMP_PARENT_G2 since learning paths (ie Nvideo > 1) are omitted
+#
+# TODO CHECK TIMING ALL 4 queries VERY SLOW SINCE INSTR WAS ADDED
+###############################################################################################################
+
+#######################################################################################################
+# Note that this cannot deal with learning paths since there are multiple trackable_ids per parent_id
+# video_duration from TMP_VIEWING_TIME_NCLICK_NBUFFER uses the 1st trackable_id ONLY
+# TMP_PAUSE_TIME determines all pauses per parent_id .
+# Thus, you can get _PAUSE in later trackable_ids which will make the total duration negative
+#######################################################################################################
+CREATE TABLE sandbox_prod.TMP_PAUSE_TIME (SELECT parent_id,video_id,SUM(total_pause_time) as total_pause_time from (
+	SELECT * FROM
+	(SELECT * FROM
+	(SELECT A.parent_id,A.video_id,A.video_version_id,pause_id,play_id,play_id-pause_id as id_diff,A.client_created_at as pause_time,B.client_created_at as play_time,
+	TIMESTAMPDIFF(SECOND,A.client_created_at,B.client_created_at) as total_pause_time from
+	(SELECT parent_id,trackable_id as video_id,video_version_id,id as pause_id,client_created_at FROM guidespark2_prod.activities 
+					WHERE client_action IN ('_PAUSE') AND is_preview IN ('active') AND parent_id IS NOT NULL GROUP BY parent_id,trackable_id,id) A
+	LEFT JOIN
+	(SELECT parent_id,trackable_id as video_id,video_version_id,id as play_id,client_created_at FROM guidespark2_prod.activities 
+					WHERE client_action IN ('_PLAY') AND is_preview IN ('active') AND parent_id IS NOT NULL GROUP BY parent_id,trackable_id,id) B
+	ON A.parent_id=B.parent_id AND A.video_id=B.video_id WHERE play_id > pause_id) T
+	GROUP BY pause_id HAVING MIN(id_diff)) TT GROUP BY play_id HAVING MAX(id_diff)) TTT GROUP BY parent_id,video_id);
+
+CREATE INDEX Iparent_id ON sandbox_prod.TMP_PAUSE_TIME (parent_id);
+
+CREATE TABLE sandbox_prod.TMP_VIEWING_TIME_NCLICK_NBUFFER_ALL (
+	SELECT * FROM (		
+			SELECT BB.title as video_title,BB.video_category,CC.industry_id,DD.name as industry_name,CC.product_line,LEFT(CC.sfdc,15) as sfdc,AA.*,
+				BB.duration as video_duration FROM
+				(SELECT GROUP_CONCAT(distinct T.account_id) as account_id,GROUP_CONCAT(distinct T.video_version_id) as video_version_id,
+				GROUP_CONCAT(distinct T.trackable_id) as video_id,
+				MIN(T.slide_id) as slide_id,parent_id,session_id,T.user_id,COUNT(distinct T.parent_id) as Nparent,TT.is_mobile,
+				COUNT(T.parent_id) as Nrecord,COUNT(distinct T.trackable_id) as Nvideo,
+				SUM(T.user_click) as Nclick,MIN(T.client_created_at) as min_time,MAX(T.client_created_at) as max_time,
+				TIMESTAMPDIFF(SECOND,MIN(T.client_created_at),MAX(T.client_created_at)) as viewing_time 
+			FROM 
+				guidespark2_prod.activities T
+			LEFT JOIN 
+				guidespark2_prod.sessions TT
+			ON T.session_id=TT.id
+			WHERE 
+				T.type IN ("PlaybackActivity") AND T.is_preview IN ('active') AND T.account_id IS NOT NULL 
+				AND T.client_created_at IS NOT NULL AND T.parent_id IS NOT NULL GROUP BY T.parent_id,T.trackable_id) AA
+ 			LEFT JOIN 
+			(select A.video_version_id,A.video_id,B.title,E.name as video_category,A.id as slide_id,C.final_slide_global,C.Nslide_total,D.duration FROM guidespark2_prod.video_slides A 
+			INNER JOIN guidespark2_prod.videos B ON A.video_id = B.id
+			INNER JOIN (select video_version_id,video_id,MAX(distinct id) as final_slide_global,COUNT(distinct id) as Nslide_total 
+						FROM guidespark2_prod.video_slides GROUP BY video_version_id,video_id) C 
+				ON A.video_version_id = C.video_version_id 
+			INNER JOIN guidespark2_prod.video_versions D 
+				ON A.video_version_id=D.id AND A.video_id=D.video_id 
+			LEFT JOIN guidespark2_prod.categories E ON B.category_id=E.id 
+			GROUP BY A.video_version_id,A.video_id,A.id) BB
+			ON AA.slide_id=BB.slide_id
+			INNER JOIN guidespark2_prod.accounts CC ON AA.account_id=CC.id 
+			LEFT JOIN guidespark2_prod.industries DD ON CC.industry_id=DD.id 
+			GROUP BY AA.parent_id,AA.slide_id) T WHERE parent_id IN (SELECT distinct parent_id FROM sandbox_prod.TMP_REACH_ALL) );
+CREATE INDEX Iparent_id ON sandbox_prod.TMP_VIEWING_TIME_NCLICK_NBUFFER_ALL (parent_id);
+CREATE INDEX Isession_id ON sandbox_prod.TMP_VIEWING_TIME_NCLICK_NBUFFER_ALL (session_id);
+CREATE INDEX Iuser_id ON sandbox_prod.TMP_VIEWING_TIME_NCLICK_NBUFFER_ALL (user_id);
+#CREATE INDEX Iaccount_id ON sandbox_prod.TMP_VIEWING_TIME_NCLICK_NBUFFER_ALL (account_id);
+
+CREATE TABLE sandbox_prod.TMP_VIEWING_TIME_NCLICK_NBUFFER (
+	SELECT * FROM (		
+			SELECT BB.title as video_title,BB.video_category,CC.industry_id,DD.name as industry_name,CC.product_line,LEFT(CC.sfdc,15) as sfdc,AA.*,
+				BB.duration as video_duration FROM
+				(SELECT GROUP_CONCAT(distinct T.account_id) as account_id,GROUP_CONCAT(distinct T.video_version_id) as video_version_id,
+				GROUP_CONCAT(distinct T.trackable_id) as video_id,
+				MIN(T.slide_id) as slide_id,parent_id,COUNT(distinct T.parent_id) as Nparent,TT.is_mobile,
+				COUNT(T.parent_id) as Nrecord,COUNT(distinct T.trackable_id) as Nvideo,
+				SUM(T.user_click) as Nclick,MIN(T.client_created_at) as min_time,MAX(T.client_created_at) as max_time,
+				TIMESTAMPDIFF(SECOND,MIN(T.client_created_at),MAX(T.client_created_at)) as viewing_time 
+			FROM 
+				guidespark2_prod.activities T
+			LEFT JOIN 
+				guidespark2_prod.sessions TT
+			ON T.session_id=TT.id
+			WHERE 
+				type IN ("PlaybackActivity") AND T.is_preview IN ('active') AND T.account_id IS NOT NULL 
+				AND T.client_created_at IS NOT NULL AND T.parent_id IS NOT NULL GROUP BY T.parent_id) AA
+ 			INNER JOIN 
+			(select A.video_version_id,A.video_id,B.title,E.name as video_category,A.id as slide_id,C.final_slide_global,C.Nslide_total,D.duration FROM guidespark2_prod.video_slides A 
+			INNER JOIN guidespark2_prod.videos B ON A.video_id = B.id
+			INNER JOIN (select video_version_id,video_id,MAX(distinct id) as final_slide_global,COUNT(distinct id) as Nslide_total FROM guidespark2_prod.video_slides GROUP BY video_version_id,video_id) C 
+				ON A.video_version_id = C.video_version_id 
+				INNER JOIN guidespark2_prod.video_versions D ON A.video_version_id=D.id AND A.video_id=D.video_id
+				LEFT JOIN guidespark2_prod.categories E ON B.category_id=E.id  
+				GROUP BY A.video_version_id,A.video_id,A.id) BB
+			ON AA.slide_id=BB.slide_id
+			INNER JOIN guidespark2_prod.accounts CC ON AA.account_id=CC.id LEFT JOIN guidespark2_prod.industries DD ON CC.industry_id=DD.id 
+			GROUP BY AA.parent_id,AA.slide_id) T WHERE parent_id IN (SELECT distinct parent_id FROM sandbox_prod.TMP_REACH_ALL) AND Nvideo = 1);
+						
+CREATE TABLE sandbox_prod.TMP_MEDIAN_VIEWING_TIME_NCLICK (
+	select video_id,video_title,video_category,industry_name,product_line,sfdc,COUNT(parent_id) as Nparent,MEDIAN(Nclick) as MEDIAN_Nclick,
+		MEDIAN(viewing_time) as MEDIAN_viewing_time,MEDIAN(viewing_time)*COUNT(parent_id) as MEDIAN_viewing_time_Nparent,
+		SUM(video_duration)/COUNT(video_duration) as AVG_duration,GROUP_CONCAT(distinct video_duration SEPARATOR ';') as video_duration_list,
+		MEDIAN(viewing_time/video_duration)*100 as MEDIAN_viewing_percentage from
+		sandbox_prod.TMP_VIEWING_TIME_NCLICK_NBUFFER GROUP BY video_id); #WHERE viewing_time > 0
+
+CREATE TABLE sandbox_prod.TMP_MEDIAN_VIEWING_TIME_NCLICK_viewGT0 (
+	select video_id,video_title,video_category,industry_name,product_line,sfdc,COUNT(parent_id) as Nparent,MEDIAN(Nclick) as MEDIAN_Nclick,
+		MEDIAN(viewing_time) as MEDIAN_viewing_time,MEDIAN(viewing_time)*COUNT(parent_id) as MEDIAN_viewing_time_Nparent,
+		SUM(video_duration)/COUNT(video_duration) as AVG_duration,GROUP_CONCAT(distinct video_duration SEPARATOR ';') as video_duration_list,
+		MEDIAN(viewing_time/video_duration)*100 as MEDIAN_viewing_percentage from
+		sandbox_prod.TMP_VIEWING_TIME_NCLICK_NBUFFER WHERE video_duration > 0 AND viewing_time > 0 GROUP BY video_id);
+
+#### Indexing TMP_PAUSE_TIME increases query speed from 8 minutes to 0.5 sec
+CREATE TABLE sandbox_prod.TMP_VIEWING_nopause (SELECT A.*,IFNULL(B.total_pause_time,0) as total_pause_time,A.viewing_time-IFNULL(B.total_pause_time,0) as viewing_time_noPause 
+			FROM sandbox_prod.TMP_VIEWING_TIME_NCLICK_NBUFFER_ALL A LEFT JOIN sandbox_prod.TMP_PAUSE_TIME B ON A.parent_id=B.parent_id AND A.video_id=B.video_id);
+						
+########################################################################################################################
+# Latest Slide Query ... does not account for '_PAUSE' and return to '_PLAY' ... in this case, slide would double count
+#
+# TMP_VIDEO_BACKTRACK
+#
+# There are a couple duplicates in TMP_VIDEO_BACKTRACK ... not entirely sure why??  Keep in mind for later
+########################################################################################################################
+	CREATE TABLE sandbox_prod.TMP_BACKTRACK_PBC (
+	SELECT trackable_id as video_id,parent_id,COUNT(parent_id) as Nbacktrack_PBC from guidespark2_prod.activities A INNER JOIN guidespark2_prod.video_slides B 
+				ON A.slide_id=B.id WHERE type IN ("PlaybackActivity") AND is_preview IN ('active') AND account_id IS NOT NULL 
+				AND client_created_at IS NOT NULL AND parent_id IS NOT NULL AND A.client_action = '_PROGRESS_BAR_CHANGE' 
+				AND ( A.old_value > (B.starts_at + B.duration)) GROUP BY trackable_id,parent_id);
+				
+	CREATE TABLE sandbox_prod.TMP_BACKTRACK_SC (
+	SELECT trackable_id as video_id,parent_id,COUNT(parent_id) as Nbacktrack_SC from guidespark2_prod.activities WHERE type IN ("PlaybackActivity") 
+				AND is_preview IN ('active') AND account_id IS NOT NULL 
+				AND client_created_at IS NOT NULL AND parent_id IS NOT NULL AND client_action = '_SLIDE_CHANGE' 
+				AND ( old_value > new_value) GROUP BY trackable_id,parent_id);
+				
+	CREATE TABLE sandbox_prod.TMP_BACKTRACK_PLAY (SELECT video_id,parent_id,COUNT(parent_id) as Nbacktrack_PLAY FROM
+	(SELECT * FROM
+	(SELECT A.video_id,A.parent_id,ended_id,play_id,play_id-ended_id as id_diff,A.client_created_at as pause_time,B.client_created_at as play_time,
+	TIMESTAMPDIFF(SECOND,A.client_created_at,B.client_created_at) as total_pause_time from
+	(SELECT trackable_id as video_id,parent_id,id as ended_id,client_created_at FROM guidespark2_prod.activities WHERE client_action IN ('_PLAYBACK_ENDED') 
+			AND is_preview IN ('active') AND parent_id IS NOT NULL GROUP BY trackable_id,parent_id,id) A
+	LEFT JOIN
+	(SELECT trackable_id as video_id,parent_id,id as play_id,client_created_at FROM guidespark2_prod.activities WHERE client_action IN ('_PLAY') 
+			AND is_preview IN ('active') AND parent_id IS NOT NULL GROUP BY trackable_id,parent_id,id) B
+	ON A.parent_id=B.parent_id WHERE play_id > ended_id) T
+	GROUP BY ended_id HAVING MIN(id_diff)) TT GROUP BY video_id,parent_id);
+	
+	#############################################################################################################
+	# Note parentheses do not work ... weird!!
+	# For some reason, this only works with 'CREATE TABLE TMP_VIDEO_BACKTRACK SELECT ....;' 
+	# INSTEAD OF 
+	# 'CREATE TABLE TMP_VIDEO_BACKTRACK (SELECT ....);'	
+	#############################################################################################################
+	CREATE TABLE sandbox_prod.TMP_VIDEO_BACKTRACK
+		SELECT T.video_id,T.parent_id,
+				IFNULL(T.Nbacktrack_PLAY,0) as Nbacktrack_PLAY,
+				IFNULL(T.Nbacktrack_PBC,0) as Nbacktrack_PBC,
+				IFNULL(C.Nbacktrack_SC,0) as Nbacktrack_SC,
+				IFNULL(T.Nbacktrack_PLAY,0)+IFNULL(T.Nbacktrack_PBC,0)+IFNULL(C.Nbacktrack_SC,0) as Nbacktrack_total 
+		FROM
+		(SELECT A.video_id,A.parent_id,IFNULL(A.Nbacktrack_PLAY,0) as Nbacktrack_PLAY,IFNULL(B.Nbacktrack_PBC,0) as Nbacktrack_PBC  
+			FROM sandbox_prod.TMP_BACKTRACK_PLAY A
+			LEFT JOIN sandbox_prod.TMP_BACKTRACK_PBC B ON A.video_id=B.video_id AND A.parent_id=B.parent_id
+		UNION
+		SELECT B.video_id,B.parent_id,IFNULL(A.Nbacktrack_PLAY,0) as Nbacktrack_PLAY,IFNULL(B.Nbacktrack_PBC,0) as Nbacktrack_PBC  
+			FROM sandbox_prod.TMP_BACKTRACK_PLAY A
+			RIGHT JOIN sandbox_prod.TMP_BACKTRACK_PBC B ON A.video_id=B.video_id AND A.parent_id=B.parent_id) T
+		LEFT JOIN
+			sandbox_prod.TMP_BACKTRACK_SC C ON T.video_id=C.video_id AND T.parent_id=C.parent_id
+		UNION 
+		SELECT D.video_id,D.parent_id,
+				IFNULL(TT.Nbacktrack_PLAY,0) as Nbacktrack_PLAY,
+				IFNULL(TT.Nbacktrack_PBC,0) as Nbacktrack_PBC,
+				IFNULL(D.Nbacktrack_SC,0) as Nbacktrack_SC,
+				IFNULL(TT.Nbacktrack_PLAY,0)+IFNULL(TT.Nbacktrack_PBC,0)+IFNULL(D.Nbacktrack_SC,0) as Nbacktrack_total 
+		FROM
+		(SELECT A.video_id,A.parent_id,IFNULL(A.Nbacktrack_PLAY,0) as Nbacktrack_PLAY,IFNULL(B.Nbacktrack_PBC,0) as Nbacktrack_PBC  
+			FROM sandbox_prod.TMP_BACKTRACK_PLAY A
+			LEFT JOIN sandbox_prod.TMP_BACKTRACK_PBC B ON A.video_id=B.video_id AND A.parent_id=B.parent_id
+		UNION
+		SELECT B.video_id,B.parent_id,IFNULL(A.Nbacktrack_PLAY,0) as Nbacktrack_PLAY,IFNULL(B.Nbacktrack_PBC,0) as Nbacktrack_PBC 
+			FROM sandbox_prod.TMP_BACKTRACK_PLAY A
+			RIGHT JOIN sandbox_prod.TMP_BACKTRACK_PBC B ON A.video_id=B.video_id AND A.parent_id=B.parent_id) TT
+		RIGHT JOIN
+			sandbox_prod.TMP_BACKTRACK_SC D ON TT.video_id=D.video_id AND TT.parent_id=D.parent_id;
+		
+CREATE INDEX Iparent_id ON sandbox_prod.TMP_VIDEO_BACKTRACK (parent_id);
+
+####################################
+# Effectiveness Breadth
+# 2) Use max slide time & absolute time
+####################################
+####################################################################
+##################### EFFECTIVENESS SCORES #########################
+####################################################################
+
+## Query 1 ... the following will summarize the furthest point reached by each parent_id
+# 6 min
+CREATE TABLE sandbox_prod.TMP_FURTHEST_POINT_parentid (
+		SELECT * FROM (
+		SELECT parent_id,GROUP_CONCAT(distinct account_id) as account_id,
+			COUNT(distinct account_id) as Naccount,
+			MIN(created_at) as min_time,MAX(created_at) as max_time,
+			COUNT(distinct trackable_id) as Nvideo,
+			COUNT(distinct video_version_id) as Nvideo_version,
+			GROUP_CONCAT(distinct trackable_id) as video_id,
+			GROUP_CONCAT(distinct video_version_id) as video_version_id,
+			min(slide_id) as min_slide,max(slide_id) as max_slide,
+			MAX(absolute_time) as max_absolute_time,COUNT(distinct slide_id) as Nslide 
+		FROM guidespark2_prod.activities 
+			WHERE parent_id IN (select distinct parent_id FROM sandbox_prod.TMP_REACH_ALL where g1_id IS NULL) 
+			AND type IN ("PlaybackActivity") AND is_preview IN ('active')
+			GROUP BY parent_id) T
+			WHERE max_time < DATE_ADD(CAST(NOW() as DATE),INTERVAL 7 hour) );
+CREATE INDEX Iparent_id ON sandbox_prod.TMP_FURTHEST_POINT_parentid (parent_id);
+
+
+## Query 2 ... the following will give the maximum slide number and time for each to calculate the furthest time percentage
+# 0.5 min
+CREATE TABLE sandbox_prod.TMP_FURTHEST_POINT_SUMMARY (
+	SELECT A.*,(B.starts_at + B.duration) as max_slide_time,B.slide_number as max_slide_number,C.duration,
+		IF(A.max_absolute_time/C.duration > 1,1,A.max_absolute_time/C.duration) as max_absolute_time_percentage,
+		IF((B.starts_at + B.duration)/C.duration > 1,1,(B.starts_at + B.duration)/C.duration) as max_slide_time_percentage
+	FROM sandbox_prod.TMP_FURTHEST_POINT_parentid A 
+		LEFT JOIN guidespark2_prod.video_slides B ON A.max_slide=B.id 	
+	LEFT JOIN guidespark2_prod.video_versions C ON A.video_version_id=C.id 
+	WHERE Nvideo = 1 and Nvideo_version = 1);
+CREATE INDEX Iparent_id ON sandbox_prod.TMP_FURTHEST_POINT_SUMMARY (parent_id);
+
+# Query 5 joins the 2 components of effectiveness from query 2 and Query 4 to calculate effectiveness for ALL g2-native, parent ids
+# 0.5 min
+CREATE TABLE sandbox_prod.TMP_EFFECTIVENESS_ALL 
+SELECT A.parent_id,A.account_id,C.name as account_name,C.benefits_eligible_employees as BEEs,
+D.title as video_title,E.name as video_category,F.name as industry_name,A.min_time,
+B.video_id,B.video_version_id,B.duration,B.Nslide_view_distinct,B.Nslide_missed,
+B.Nslide_view_total,B.Nslide_total,B.global_slide_view_percentage,
+B.global_slide_view_percentage_distinct,
+A.min_slide,A.max_slide,A.max_absolute_time,A.max_slide_time,
+A.max_absolute_time_percentage,A.max_slide_time_percentage,
+A.max_absolute_time_percentage*B.global_slide_view_percentage_distinct as effectiveness_absolute
+FROM sandbox_prod.TMP_FURTHEST_POINT_SUMMARY A
+LEFT JOIN sandbox_prod.TMP_NSLIDE_VIEW_GLOBAL B ON A.parent_id=B.parent_id
+LEFT JOIN guidespark2_prod.accounts C ON A.account_id=C.id
+LEFT JOIN guidespark2_prod.videos D ON A.video_id=D.id
+LEFT JOIN guidespark2_prod.categories E ON D.category_id=E.id
+LEFT JOIN guidespark2_prod.industries F ON C.industry_id=F.id
+WHERE 
+A.video_id IS NOT NULL AND B.global_slide_view_percentage_distinct IS NOT NULL;
+
+CREATE INDEX Iparent_id ON sandbox_prod.TMP_EFFECTIVENESS_ALL (parent_id);
+
+####################
+#CREATE TABLE TMP_EFFECTIVENESS (
+#SELECT parent_id,GROUP_CONCAT(distinct account_id) as account_id,COUNT(distinct account_id) as Naccount,MIN(client_created_at) as min_time,COUNT(distinct trackable_id) as Nvideo,
+#		COUNT(distinct video_version_id) as Nvideo_version,GROUP_CONCAT(distinct trackable_id) as video_id,GROUP_CONCAT(distinct video_version_id) as video_version_id,
+#		min(slide_id) as min_slide,max(slide_id) as max_slide,MAX(absolute_time) as max_absolute_time,COUNT(distinct slide_id) as Nslide from guidespark2_prod.activities where parent_id
+# IN (select distinct parent_id FROM sandbox_prod.TMP_REACH_ALL) GROUP BY parent_id);
+#
+#CREATE TABLE TMP_EFFECTIVENESS_SUMMARY (
+#SELECT A.*,(B.starts_at + B.duration) as max_slide_time,B.slide_number as max_slide_number,C.duration,
+#			IF(A.max_absolute_time/C.duration > 1,1,A.max_absolute_time/C.duration) as max_absolute_time_percentage,
+#			IF((B.starts_at + B.duration)/C.duration > 1,1,(B.starts_at + B.duration)/C.duration) as max_slide_time_percentage
+#			FROM sandbox_prod.TMP_EFFECTIVENESS A LEFT JOIN guidespark2_prod.video_slides B ON A.max_slide=B.id LEFT JOIN guidespark2_prod.video_versions C ON A.video_version_id=C.id 
+#			WHERE Nvideo = 1);
+#
+#CREATE INDEX Iparent_id ON TMP_EFFECTIVENESS (parent_id);
+#CREATE INDEX Iparent_id ON TMP_EFFECTIVENESS_SUMMARY (parent_id);
+#			
+#CREATE TABLE TMP_EFFECTIVENESS_SUMMARY_preOE14 (
+#SELECT A.*,(B.starts_at + B.duration) as max_slide_time,B.slide_number as max_slide_number,C.duration,
+#			IF(A.max_absolute_time/C.duration > 1,1,A.max_absolute_time/C.duration) as max_absolute_time_percentage,
+#			IF((B.starts_at + B.duration)/C.duration > 1,1,(B.starts_at + B.duration)/C.duration) as max_slide_time_percentage
+#			FROM TMP_EFFECTIVENESS A LEFT JOIN guidespark2_prod.video_slides B ON A.max_slide=B.id LEFT JOIN guidespark2_prod.video_versions C ON A.video_version_id=C.id 
+#			WHERE Nvideo = 1 AND min_time < '2014-08-01 00:00:00');
+#
+#CREATE TABLE TMP_EFFECTIVENESS_SUMMARY_OE14 (
+#SELECT A.*,(B.starts_at + B.duration) as max_slide_time,B.slide_number as max_slide_number,C.duration,
+#			IF(A.max_absolute_time/C.duration > 1,1,A.max_absolute_time/C.duration) as max_absolute_time_percentage,
+#			IF((B.starts_at + B.duration)/C.duration > 1,1,(B.starts_at + B.duration)/C.duration) as max_slide_time_percentage
+#			FROM TMP_EFFECTIVENESS A LEFT JOIN guidespark2_prod.video_slides B ON A.max_slide=B.id LEFT JOIN guidespark2_prod.video_versions C ON A.video_version_id=C.id 
+#			WHERE Nvideo = 1 AND min_time >= '2014-08-01 00:00:00');
+
+#CREATE INDEX Iparent_id ON TMP_EFFECTIVENESS_SUMMARY_preOE14 (parent_id);
+#CREATE INDEX Iparent_id ON TMP_EFFECTIVENESS_SUMMARY_OE14 (parent_id);	
+
+####################################################################
+#
+# Combine critical metrics
+# This will be input to R to answer ... how are customers doing?
+# Metrics
+# 1) 
+####################################################################
+CREATE TABLE sandbox_prod.TMP_PARENT_SUMMARY (
+	SELECT A.*,G.country_code,G.region_code,G.latitude,G.longitude,
+		E.name as account_name,E.benefits_eligible_employees as BEEs,
+		A.viewing_time/A.video_duration as viewing_time_percentage,
+		B.video_version_id as NEWvideo_version,B.duration,B.Nslide_view_distinct,B.Nslide_missed,
+		B.Nslide_view_total,B.Nslide_total,B.global_slide_view_percentage,
+		(B.Nslide_view_distinct/B.Nslide_total) as global_slide_view_percentage_distinct_OLD,
+		B.Nplayback_ended,
+		B.max_viewed_slide,(B.max_viewed_slide/B.Nslide_total) as max_slide_view_percentage,
+		#B.viewing_end_time,B.viewing_end_time/A.video_duration as viewing_end_time_percentage,
+		F.min_slide,F.max_slide,F.duration as TRUTH_duration,F.max_absolute_time,F.max_slide_time,
+		F.max_absolute_time_percentage,F.max_slide_time_percentage,
+		F.global_slide_view_percentage_distinct,
+		F.effectiveness_absolute,
+		IFNULL(C.Nbacktrack_PLAY,0) as Nbacktrack_PLAY, 
+		IFNULL(C.Nbacktrack_PBC,0) as Nbacktrack_PBC, 
+		IFNULL(C.Nbacktrack_SC,0) as Nbacktrack_SC, 
+		IFNULL(C.Nbacktrack_total,0) as Nbacktrack_total,
+		D.drop_slide,D.slide_number as drop_slide_number,D.max_slide_id
+		FROM 
+			sandbox_prod.TMP_VIEWING_TIME_NCLICK_NBUFFER_ALL A 
+		LEFT JOIN 
+			sandbox_prod.TMP_NSLIDE_VIEW_GLOBAL B 
+			ON A.parent_id=B.parent_id AND A.video_id=B.video_id
+		LEFT JOIN
+			sandbox_prod.TMP_VIDEO_BACKTRACK C
+			ON A.parent_id=C.parent_id AND A.video_id=C.video_id
+		LEFT JOIN 
+			sandbox_prod.TMP_EFFECTIVENESS_ALL F
+			ON A.parent_id=F.parent_id
+		LEFT JOIN
+			sandbox_prod.TMP_DROP_SLIDE_DETAIL D
+			ON A.parent_id=D.parent_id AND A.video_id=D.video_id
+		LEFT JOIN
+			guidespark2_prod.accounts E
+			ON A.account_id=E.id
+		LEFT JOIN
+		    (select session_id,country_code,region_code,latitude,longitude from guidespark2_prod.session_locations G GROUP BY session_id) G
+		    ON A.session_id=G.session_id
+		WHERE
+			A.video_id IS NOT NULL);
+			
+CREATE TABLE sandbox_prod.TMP_PARENT_SUMMARY_nopause (
+	SELECT A.*,G.country_code,G.region_code,G.latitude,G.longitude,
+		E.name as account_name,E.benefits_eligible_employees as BEEs,
+		A.viewing_time_noPause/A.video_duration as viewing_time_percentage,
+		B.video_version_id as NEWvideo_version,B.duration,B.Nslide_view_distinct,B.Nslide_missed,
+		B.Nslide_view_total,B.Nslide_total,B.global_slide_view_percentage,
+		(B.Nslide_view_distinct/B.Nslide_total) as global_slide_view_percentage_distinct_OLD,
+		B.Nplayback_ended,
+		B.max_viewed_slide,(B.max_viewed_slide/B.Nslide_total) as max_slide_view_percentage,
+		#B.viewing_end_time,B.viewing_end_time/A.video_duration as viewing_end_time_percentage,
+		F.min_slide,F.max_slide,F.duration as TRUTH_duration,F.max_absolute_time,F.max_slide_time,
+		F.max_absolute_time_percentage,F.max_slide_time_percentage,
+		F.global_slide_view_percentage_distinct,
+		F.effectiveness_absolute,
+		IFNULL(C.Nbacktrack_PLAY,0) as Nbacktrack_PLAY, 
+		IFNULL(C.Nbacktrack_PBC,0) as Nbacktrack_PBC, 
+		IFNULL(C.Nbacktrack_SC,0) as Nbacktrack_SC, 
+		IFNULL(C.Nbacktrack_total,0) as Nbacktrack_total,
+		D.drop_slide,D.slide_number as drop_slide_number,D.max_slide_id 
+		FROM 
+			sandbox_prod.TMP_VIEWING_nopause A 
+		LEFT JOIN 
+			sandbox_prod.TMP_NSLIDE_VIEW_GLOBAL B 
+			ON A.parent_id=B.parent_id AND A.video_id=B.video_id
+		LEFT JOIN
+			sandbox_prod.TMP_VIDEO_BACKTRACK C
+			ON A.parent_id=C.parent_id AND A.video_id=C.video_id
+		LEFT JOIN 
+			sandbox_prod.TMP_EFFECTIVENESS_ALL F
+			ON A.parent_id=F.parent_id
+		LEFT JOIN
+			sandbox_prod.TMP_DROP_SLIDE_DETAIL D
+			ON A.parent_id=D.parent_id AND A.video_id=D.video_id
+		LEFT JOIN
+			guidespark2_prod.accounts E
+			ON A.account_id=E.id
+		LEFT JOIN
+		    (select session_id,country_code,region_code,latitude,longitude from guidespark2_prod.session_locations G GROUP BY session_id) G
+		    ON A.session_id=G.session_id
+		WHERE 
+			A.video_id IS NOT NULL);
+		
+##################################################################
+################  Activity Metric #10 and #11 ####################
+##################################################################
+# guidespark2_prod.videos Watched per Session
+#########################################################
+
+########################################################################################################################
+# Latest Slide Query ... does not account for '_PAUSE' and return to '_PLAY' ... in this case, slide would double count
+#
+# TMP_NVIDEO_PER_SESSION
+# account_id <- unique_id for account
+# session_id <- unique session identifier
+# Nrecord <- # of records in g2
+# Nrecord_video_distinct <- # of distinct guidespark2_prod.videos viewed
+# Nrecord_parent_distinct <- # of distinct parent_ids
+# guidespark2_prod.videos <- video ids
+#
+# TMP_NVIDEO_PER_SESSION now tracks TMP_SESSION_G2
+#
+# OLD ... TMP_NVIDEO_PER_SESSION has more sessions than TMP_SESSION_G2 due to some duplicate session_ids across multiple guidespark2_prod.accounts
+# on 8/21/14 its (123/55020 or about 0.25% .. trivial)
+# 1) Likely due to INTERNAL guidespark sessions logging into multiple guidespark2_prod.accounts
+# 
+########################################################################################################################
+
+CREATE TABLE sandbox_prod.TMP_NVIDEO_PER_SESSION_g1g2 (		
+	SELECT T.*,TT.`name`,TT.benefits_eligible_employees as BEE from (
+	SELECT A.*,B.Ntotal_library,A.Nvideo_distinct/Ntotal_library as Nvideo_views_distinct, A.Nparent_distinct/Ntotal_library as Nvideo_views from
+	(select
+    	session_id,GROUP_CONCAT(distinct account_id ORDER BY account_id) as account_id,COUNT(distinct account_id) as Naccount,
+    	MIN(created_at) as min_date,COUNT(id) as Nrecord,
+    	COUNT(distinct trackable_id) as Nvideo_distinct,COUNT(distinct parent_id) as Nparent_distinct,
+    	GROUP_CONCAT(distinct trackable_id ORDER BY trackable_id) as videos_viewed
+    from
+    	guidespark2_prod.activities 
+    	WHERE type IN ("PlaybackActivity") AND is_preview IN ('active') AND client_action IN ('_PLAY') AND account_id IS NOT NULL 
+	GROUP BY session_id) A
+	LEFT JOIN
+	(select
+    	account_id,COUNT(distinct trackable_id) as Ntotal_library
+    from
+    	guidespark2_prod.activities 
+    	WHERE type IN ("PlaybackActivity") AND is_preview IN ('active') AND client_action IN ('_PLAY') AND account_id IS NOT NULL
+	GROUP BY account_id) B
+	ON A.account_id=B.account_id) T 
+	LEFT JOIN 
+	guidespark2_prod.accounts TT
+	ON T.account_id=TT.id
+	WHERE T.account_id IN (SELECT account_id FROM sandbox_prod.TMP_SFDC_GROUP) );
+
+CREATE TABLE sandbox_prod.TMP_NVIDEO_PER_SESSION (		
+	SELECT T.*,TT.`name`,TT.benefits_eligible_employees as BEE,LEFT(TT.sfdc,15) as sfdc from (
+	SELECT A.*,B.Ntotal_library,A.Nvideo_distinct/Ntotal_library as Nvideo_views_distinct, A.Nparent_distinct/Ntotal_library as Nvideo_views from
+	(select
+    	AA.session_id,GROUP_CONCAT(distinct AA.account_id ORDER BY AA.account_id) as account_id,COUNT(distinct AA.account_id) as Naccount,
+    	MIN(AA.created_at) as min_date,COUNT(AA.id) as Nrecord,BB.is_mobile,
+    	COUNT(distinct AA.trackable_id) as Nvideo_distinct,COUNT(distinct AA.parent_id) as Nparent_distinct,
+    	GROUP_CONCAT(distinct AA.trackable_id) as videos_viewed,GROUP_CONCAT(distinct CC.title) as video_title_viewed,
+    	GROUP_CONCAT(distinct DD.name) as video_category
+    from
+    	guidespark2_prod.activities AA
+    LEFT JOIN
+    	guidespark2_prod.sessions BB
+    ON AA.session_id=BB.id
+    LEFT JOIN
+    	guidespark2_prod.videos CC
+    ON AA.trackable_id=CC.id
+    LEFT JOIN 
+    	guidespark2_prod.categories DD
+    ON CC.category_id=DD.id
+    	WHERE AA.type IN ("PlaybackActivity") AND AA.is_preview IN ('active') AND AA.client_action IN ('_PLAY') AND AA.account_id IS NOT NULL 
+    	AND AA.client_created_at IS NOT NULL AND AA.session_id IS NOT NULL ## AND AA.slide_id IS NOT NULL
+	GROUP BY AA.session_id) A
+	LEFT JOIN
+	(select
+    	account_id,COUNT(distinct trackable_id) as Ntotal_library
+    from
+    	guidespark2_prod.activities 
+    	WHERE type IN ("PlaybackActivity") AND is_preview IN ('active') AND client_action IN ('_PLAY') AND account_id IS NOT NULL
+    	AND client_created_at IS NOT NULL ## AND slide_id IS NOT NULL
+	GROUP BY account_id) B
+	ON A.account_id=B.account_id) T 
+	LEFT JOIN 
+	guidespark2_prod.accounts TT
+	ON T.account_id=TT.id
+	WHERE T.account_id IN (SELECT account_id FROM sandbox_prod.TMP_SFDC_GROUP) );
+	
+CREATE TABLE sandbox_prod.TMP_NVIDEO_PER_SESSION_VIDEO_ORDER (		
+	SELECT T.*,TT.`name`,TT.benefits_eligible_employees as BEE,LEFT(TT.sfdc,15) as sfdc from (
+	SELECT A.*,B.Ntotal_library,A.Nvideo_distinct/Ntotal_library as Nvideo_views_distinct, A.Nparent_distinct/Ntotal_library as Nvideo_views from
+	(SELECT session_id,GROUP_CONCAT(distinct account_id) as account_id,
+		MIN(min_date) as min_date,MAX(max_date) as max_date,GROUP_CONCAT(Nrecord) as Nrecord_list,SUM(Nrecord) as Nrecord,is_mobile,
+		COUNT(distinct video_id) as Nvideo_distinct,SUM(Nvideo) as Nparent_distinct,GROUP_CONCAT(video_id) as videos_viewed,
+		GROUP_CONCAT(video_title) as video_title,GROUP_CONCAT(video_category) as video_category
+		FROM
+		(select
+			AA.session_id,AA.parent_id,GROUP_CONCAT(distinct AA.account_id) as account_id,COUNT(distinct AA.account_id) as Naccount,
+    		MIN(AA.created_at) as min_date,MAX(AA.created_at) as max_date,COUNT(AA.id) as Nrecord,BB.is_mobile,
+    		COUNT(distinct AA.trackable_id) as Nvideo,GROUP_CONCAT(distinct AA.trackable_id) as video_id,
+    		GROUP_CONCAT(distinct CC.title) as video_title,GROUP_CONCAT(distinct DD.name) as video_category
+    	from
+    		guidespark2_prod.activities AA
+    	LEFT JOIN
+    		guidespark2_prod.sessions BB
+    	ON AA.session_id=BB.id
+    	LEFT JOIN
+    		guidespark2_prod.videos CC
+    	ON AA.trackable_id=CC.id
+    	LEFT JOIN 
+    		guidespark2_prod.categories DD
+    	ON CC.category_id=DD.id
+    		WHERE AA.type IN ("PlaybackActivity") AND AA.is_preview IN ('active') AND AA.client_action IN ('_PLAY') AND AA.account_id IS NOT NULL 
+    		AND AA.client_created_at IS NOT NULL AND AA.session_id IS NOT NULL ## AND AA.slide_id IS NOT NULL
+		GROUP BY AA.session_id,AA.parent_id) TTT
+	GROUP BY session_id) A
+	LEFT JOIN
+		(select
+   	 	account_id,COUNT(distinct trackable_id) as Ntotal_library
+   		from
+    		guidespark2_prod.activities 
+    		WHERE type IN ("PlaybackActivity") AND is_preview IN ('active') AND client_action IN ('_PLAY') AND account_id IS NOT NULL
+    		AND client_created_at IS NOT NULL ## AND slide_id IS NOT NULL
+		GROUP BY account_id
+	) B
+	ON A.account_id=B.account_id) T 
+	LEFT JOIN 
+	guidespark2_prod.accounts TT
+	ON T.account_id=TT.id );
+	#WHERE T.account_id IN (SELECT account_id FROM TMP_SFDC_GROUP) );
+
+CREATE TABLE sandbox_prod.TMP_NVIDEO_PER_SESSION_LIBRARY (
+		SELECT Ntotal_library,COUNT(distinct session_id) as Nsession,
+				SUM(Nvideo_distinct) as Nvideo_distinct_total,
+				AVG(Nvideo_distinct) as Nvideo_distinct_average,
+				MEDIAN(Nvideo_distinct) as Nvideo_distinct_median
+		FROM sandbox_prod.TMP_NVIDEO_PER_SESSION GROUP BY Ntotal_library);
+		
+CREATE TABLE sandbox_prod.TMP_NVIDEO_PER_SESSION_ACCOUNT
+	(SELECT account_id,GROUP_CONCAT(distinct name) as account_name,
+		BEE,COUNT(session_id) as Nsession,SUM(is_mobile) as Nsession_mobile,
+		SUM(is_mobile)/COUNT(session_id) as session_mobile_percentage,
+		MAX(Ntotal_library) as Ntotal_library,
+		AVG(Nrecord) as AVG_Nrecord,
+		AVG(Nvideo_distinct) as AVG_Nvideo_distinct,
+		AVG(Nparent_distinct) as AVG_Nparent_distinct,
+		MEDIAN(Nrecord) as MEDIAN_Nrecord,
+		MEDIAN(Nvideo_distinct) as MEDIAN_Nvideo_distinct,
+		MEDIAN(Nparent_distinct) as MEDIAN_Nparent_distinct,
+		MEDIAN(Nvideo_views_distinct) as MEDIAN_Nvideo_views_distinct,
+		MEDIAN(Nvideo_views) as MEDIAN_Nvideo_views 
+		FROM sandbox_prod.TMP_NVIDEO_PER_SESSION 
+		GROUP BY account_id);
+
+CREATE TABLE sandbox_prod.TMP_NVIDEO_PER_SESSION_SFDC
+	(SELECT sfdc,GROUP_CONCAT(distinct account_id) as account_id,
+		GROUP_CONCAT(distinct name) as account_name,BEE,COUNT(session_id) as Nsession,
+		SUM(is_mobile) as Nsession_mobile,
+		SUM(is_mobile)/COUNT(session_id) as session_mobile_percentage,
+		MAX(Ntotal_library) as Ntotal_library,
+		AVG(Nrecord) as AVG_Nrecord,
+		AVG(Nvideo_distinct) as AVG_Nvideo_distinct,
+		AVG(Nparent_distinct) as AVG_Nparent_distinct,
+		MEDIAN(Nrecord) as MEDIAN_Nrecord,
+		MEDIAN(Nvideo_distinct) as MEDIAN_Nvideo_distinct,
+		MEDIAN(Nparent_distinct) as MEDIAN_Nparent_distinct,
+		MEDIAN(Nvideo_views_distinct) as MEDIAN_Nvideo_views_distinct,
+		MEDIAN(Nvideo_views) as MEDIAN_Nvideo_views 
+		FROM sandbox_prod.TMP_NVIDEO_PER_SESSION 
+		GROUP BY HEX(sfdc));
+				
+CREATE TABLE sandbox_prod.TMP_NVIDEO_PER_USER_SESSION (	
+	SELECT T.*,TT.`name`,TT.benefits_eligible_employees as BEE from (	
+	SELECT A.*,B.Ntotal_library,A.Nvideo_distinct/Ntotal_library as Nvideo_views_distinct, A.Nparent_distinct/Ntotal_library as Nvideo_views from
+	(select
+    	user_id,session_id,GROUP_CONCAT(distinct account_id ORDER BY account_id) as account_id,COUNT(distinct account_id) as Naccount,
+    	MIN(created_at) as min_date,COUNT(id) as Nrecord,
+    	COUNT(distinct trackable_id) as Nvideo_distinct,COUNT(distinct parent_id) as Nparent_distinct,
+    	GROUP_CONCAT(distinct trackable_id) as videos_viewed
+    from
+    	guidespark2_prod.activities 
+    	WHERE type IN ("PlaybackActivity") AND is_preview IN ('active') AND client_action IN ('_PLAY') AND account_id IS NOT NULL 
+    	AND client_created_at IS NOT NULL ## AND slide_id IS NOT NULL
+	GROUP BY user_id,session_id) A
+	LEFT JOIN
+	(select
+    	account_id,COUNT(distinct trackable_id) as Ntotal_library
+    from
+    	guidespark2_prod.activities 
+    	WHERE type IN ("PlaybackActivity") AND is_preview IN ('active') AND client_action IN ('_PLAY') AND account_id IS NOT NULL
+    	AND client_created_at IS NOT NULL ## AND slide_id IS NOT NULL
+	GROUP BY account_id) B
+	ON A.account_id=B.account_id) T 
+	LEFT JOIN 
+	guidespark2_prod.accounts TT
+	ON T.account_id=TT.id
+	WHERE T.account_id IN (SELECT account_id FROM sandbox_prod.TMP_SFDC_GROUP) );
+
+CREATE TABLE sandbox_prod.TMP_NVIDEO_PER_USER_SESSION_GLOBAL 
+	(SELECT account_id,`name`,BEE,COUNT(distinct user_id) as Nuser,
+		COUNT(distinct session_id) as Nsession,Ntotal_library,
+		AVG(Nrecord) as AVG_Nrecord,
+		AVG(Nvideo_distinct) as AVG_Nvideo_distinct,
+		AVG(Nparent_distinct) as AVG_Nparent_distinct,
+		MEDIAN(Nrecord) as MEDIAN_Nrecord,
+		MEDIAN(Nvideo_distinct) as MEDIAN_Nvideo_distinct,
+		MEDIAN(Nparent_distinct) as MEDIAN_Nparent_distinct,
+		MEDIAN(Nvideo_views_distinct) as MEDIAN_Nvideo_views_distinct,
+		MEDIAN(Nvideo_views) as MEDIAN_Nvideo_views 
+		FROM sandbox_prod.TMP_NVIDEO_PER_USER_SESSION 
+		GROUP BY account_id);
+
+CREATE TABLE sandbox_prod.TMP_NVIDEO_PER_USER (		
+	SELECT T.*,TT.`name`,TT.benefits_eligible_employees as BEE from (
+	SELECT A.*,B.Ntotal_library,A.Nvideo_distinct/Ntotal_library as Nvideo_views_distinct, A.Nparent_distinct/Ntotal_library as Nvideo_views from
+	(select
+    	user_id,GROUP_CONCAT(distinct account_id ORDER BY account_id) as account_id,COUNT(distinct account_id) as Naccount,MIN(created_at) as min_date,COUNT(id) as Nrecord,
+    	COUNT(distinct trackable_id) as Nvideo_distinct,COUNT(distinct parent_id) as Nparent_distinct,
+    	GROUP_CONCAT(distinct trackable_id) as videos_viewed
+    from
+    	guidespark2_prod.activities 
+    	WHERE type IN ("PlaybackActivity") AND is_preview IN ('active') AND client_action IN ('_PLAY') AND account_id IS NOT NULL 
+    	AND client_created_at IS NOT NULL ## AND slide_id IS NOT NULL
+	GROUP BY user_id) A
+	LEFT JOIN
+	(select
+    	account_id,COUNT(distinct trackable_id) as Ntotal_library
+    from
+    	guidespark2_prod.activities 
+    	WHERE type IN ("PlaybackActivity") AND is_preview IN ('active') AND client_action IN ('_PLAY') AND account_id IS NOT NULL
+    	AND client_created_at IS NOT NULL ## AND slide_id IS NOT NULL
+	GROUP BY account_id) B
+	ON A.account_id=B.account_id) T 
+	LEFT JOIN 
+	guidespark2_prod.accounts TT
+	ON T.account_id=TT.id
+	WHERE T.account_id IN (SELECT account_id FROM sandbox_prod.TMP_SFDC_GROUP) );
+
+CREATE TABLE sandbox_prod.TMP_NVIDEO_PER_USER_GLOBAL 
+	(SELECT account_id,`name`,BEE,COUNT(user_id) as Nuser,Ntotal_library,
+		AVG(Nrecord) as AVG_Nrecord,
+		AVG(Nvideo_distinct) as AVG_Nvideo_distinct,
+		AVG(Nparent_distinct) as AVG_Nparent_distinct,
+		MEDIAN(Nrecord) as MEDIAN_Nrecord,
+		MEDIAN(Nvideo_distinct) as MEDIAN_Nvideo_distinct,
+		MEDIAN(Nparent_distinct) as MEDIAN_Nparent_distinct,
+		MEDIAN(Nvideo_views_distinct) as MEDIAN_Nvideo_views_distinct,
+		MEDIAN(Nvideo_views) as MEDIAN_Nvideo_views 
+		FROM sandbox_prod.TMP_NVIDEO_PER_USER 
+		GROUP BY account_id);
+
+##################################################################
+###################### IMPRESSION STATS ##########################
+##################################################################
+CREATE TABLE sandbox_prod.BM_IMPRESSION_ACCOUNT
+	SELECT A.account_id,B.name,B.sfdc,B.benefits_eligible_employees as BEEs,COUNT(user_id) as Nuser,COUNT(session_id) as Nsession,SUM(Nimpression) as Nimpression FROM (
+		SELECT account_id,user_id,session_id,COUNT(distinct session_id) as Nsession,COUNT(account_id) as Nimpression 
+			FROM guidespark2_prod.activities where is_preview = 'active' AND action IN ('show','play','my_guidespark2_prod.videos') and trackable_type IN ('CustomLink','LearningPath','User','Video') 
+			AND account_id NOT IN (1) GROUP BY account_id,user_id,session_id) A LEFT JOIN guidespark2_prod.accounts B on A.account_id=B.id GROUP BY account_id;
+
+CREATE TABLE sandbox_prod.BM_IMPRESSION_OE14_ACCOUNT
+	SELECT A.account_id,B.name,B.sfdc,B.benefits_eligible_employees as BEEs,COUNT(user_id) as Nuser,COUNT(session_id) as Nsession,SUM(Nimpression) as Nimpression FROM (
+		SELECT account_id,user_id,session_id,COUNT(distinct session_id) as Nsession,COUNT(account_id) as Nimpression 
+			FROM guidespark2_prod.activities where is_preview = 'active' AND action IN ('show','play','my_guidespark2_prod.videos') and trackable_type IN ('CustomLink','LearningPath','User','Video') 
+			AND account_id NOT IN (1) and created_at BETWEEN '2014-08-01 00:00:00' AND '2014-11-30 00:00:00' GROUP BY account_id,user_id,session_id) A LEFT JOIN guidespark2_prod.accounts B on A.account_id=B.id GROUP BY account_id;
+
+CREATE TABLE sandbox_prod.BM_IMPRESSION_SFDC
+	SELECT B.sfdc,GROUP_CONCAT(B.name) as name,GROUP_CONCAT(A.account_id) as account_id,COUNT(distinct A.account_id) as Naccount,
+		B.benefits_eligible_employees as BEEs,COUNT(user_id) as Nuser,COUNT(session_id) as Nsession,SUM(Nimpression) as Nimpression FROM (
+		SELECT account_id,user_id,session_id,COUNT(distinct session_id) as Nsession,COUNT(account_id) as Nimpression 
+			FROM guidespark2_prod.activities where is_preview = 'active' AND action IN ('show','play','my_guidespark2_prod.videos') and trackable_type IN ('CustomLink','LearningPath','User','Video') 
+			AND account_id NOT IN (1) GROUP BY account_id,user_id,session_id) A LEFT JOIN guidespark2_prod.accounts B on A.account_id=B.id GROUP BY HEX(sfdc);
+
+CREATE TABLE sandbox_prod.BM_IMPRESSION_OE14_SFDC
+	SELECT A.account_id,B.name,B.sfdc,B.benefits_eligible_employees as BEEs,COUNT(user_id) as Nuser,COUNT(session_id) as Nsession,SUM(Nimpression) as Nimpression FROM (
+		SELECT account_id,user_id,session_id,COUNT(distinct session_id) as Nsession,COUNT(account_id) as Nimpression 
+			FROM guidespark2_prod.activities where is_preview = 'active' AND action IN ('show','play','my_guidespark2_prod.videos') and trackable_type IN ('CustomLink','LearningPath','User','Video') 
+			AND account_id NOT IN (1) and created_at BETWEEN '2014-08-01 00:00:00' AND '2014-11-30 00:00:00' GROUP BY account_id,user_id,session_id) A LEFT JOIN guidespark2_prod.accounts B on A.account_id=B.id GROUP BY account_id;
+									
+#####################################################################################################
+# 1) How many guidespark2_prod.videos have surveys? (as of 9/2/14 ... only 96 guidespark2_prod.videos have survey guidespark2_prod.answers)
+#####################################################################################################
+
+CREATE TABLE sandbox_prod.TMP_SURVEY (
+select T.*,IFNULL(TT.Nanswer,0) as Nanswer,IFNULL(TT.Nanswer,0)/T.Nquestion as Nuser from (
+		select B.account_content_id,A.assessment_id,B.active,COUNT(A.id) as Nquestion,C.account_id,C.contentable_id as video_id
+			FROM guidespark2_prod.questions A 
+					INNER JOIN guidespark2_prod.account_content_assessments B ON A.assessment_id=B.assessment_id 
+					INNER JOIN guidespark2_prod.account_contents C ON B.account_content_id=C.id 
+					GROUP BY B.account_content_id,A.assessment_id) T
+					LEFT JOIN
+						(select account_id,video_id,assessment_id,COUNT(id) as Nanswer from guidespark2_prod.answers GROUP BY account_id,video_id,assessment_id) TT
+						ON T.account_id=TT.account_id AND T.video_id=TT.video_id AND T.assessment_id=TT.assessment_id
+						GROUP BY T.account_id,T.video_id,T.assessment_id);
+						 						 
+
+#####################################################################################################
+# 2) How many viewers are using the surveys (as of 9/2/14 ... only 96 guidespark2_prod.videos have survey guidespark2_prod.answers)
+#####################################################################################################
+CREATE TABLE sandbox_prod.TMP_SURVEY_QUESTION_ANSWER
+SELECT A.account_id,A.video_id,C.video_title,min(A.created_at) as min_date,max(A.created_at) as max_date,REPLACE(REPLACE(REPLACE(B.question_text,',',''),'\n',''),'\r',' ') as question_text,
+		A.question_id,A.scale_value,COUNT(A.video_id) as Nsurvey_response,C.Nview
+		FROM guidespark2_prod.answers A
+		LEFT JOIN guidespark2_prod.questions B ON A.question_id=B.id
+		LEFT JOIN (SELECT trackable_id as video_id,video_title,COUNT(trackable_id) as Nview FROM benchmark_prod.TMP_REACH_ALL GROUP BY trackable_id) C ON A.video_id = C.video_id
+		GROUP BY A.video_id,A.question_id,A.scale_value;
+		
+CREATE TABLE sandbox_prod.TMP_SURVEY_QUESTION_ANSWER_2015OE_Sept
+SELECT A.account_id,A.video_id,C.video_title,min(A.created_at) as min_date,max(A.created_at) as max_date,REPLACE(REPLACE(REPLACE(B.question_text,',',''),'\n',''),'\r',' ') as question_text,
+		A.question_id,A.scale_value,COUNT(A.video_id) as Nsurvey_response,C.Nview
+		FROM guidespark2_prod.answers A
+		LEFT JOIN guidespark2_prod.questions B ON A.question_id=B.id
+		LEFT JOIN (SELECT trackable_id as video_id,video_title,COUNT(trackable_id) as Nview FROM benchmark_prod.TMP_REACH_ALL GROUP BY trackable_id) C ON A.video_id = C.video_id
+		WHERE A.created_at > '2015-09-01 00:00:00'
+		GROUP BY A.video_id,A.question_id,A.scale_value;
+
+CREATE TABLE sandbox_prod.TMP_SURVEY_QUESTION_ANSWER_2015OE_Aug
+SELECT A.account_id,A.video_id,C.video_title,min(A.created_at) as min_date,max(A.created_at) as max_date,REPLACE(REPLACE(REPLACE(B.question_text,',',''),'\n',''),'\r',' ') as question_text,
+        A.question_id,A.scale_value,COUNT(A.video_id) as Nsurvey_response,C.Nview
+        FROM guidespark2_prod.answers A
+        LEFT JOIN guidespark2_prod.questions B ON A.question_id=B.id
+        LEFT JOIN (SELECT trackable_id as video_id,video_title,COUNT(trackable_id) as Nview FROM benchmark_prod.TMP_REACH_ALL GROUP BY trackable_id) C ON A.video_id = C.video_id
+        WHERE A.created_at > '2015-08-01 00:00:00'
+        GROUP BY A.video_id,A.question_id,A.scale_value;
+
+##############################################################################
+# Video Versions Lookup Table for SFDC / Attask / g2 integration ... 9/16/14
+##############################################################################				
+CREATE TABLE sandbox_prod.TMP_MATCH_VIDEO
+	SELECT B.name as account_name,C.title as video_title,A.video_id,A.video_version_id,D.name as video_category,A.account_id,A.min_date,C.created_at
+		from
+	(select
+    	account_id,trackable_id as video_id,video_version_id,MIN(created_at) as min_date
+    from
+    	guidespark2_prod.activities WHERE type IN ("PlaybackActivity") AND is_preview IN ('active') AND account_id IS NOT NULL
+	GROUP BY trackable_id,video_version_id) A 
+	LEFT JOIN guidespark2_prod.accounts B ON A.account_id=B.id 
+	LEFT JOIN guidespark2_prod.videos C ON A.video_id=C.id
+	LEFT JOIN guidespark2_prod.categories D ON C.category_id=D.id;	
+
+########################################
+# CREATE D2 PLOT VALUES
+# Order of each parent_id
+########################################
+CREATE TABLE sandbox_prod.TMP_D2_PLOT (new_id BIGINT NOT NULL AUTO_INCREMENT,PRIMARY KEY my_pkey (new_id)) 
+SELECT A.account_id,A.parent_id,A.session_id,A.user_id,A.trackable_id as video_id,A.video_version_id,A.created_at,A.client_action,A.slide_id,B.title,B.slide_number,C.max_slide_id,C.max_slide_number  
+FROM guidespark2_prod.activities A 
+LEFT JOIN 
+guidespark2_prod.video_slides B 
+ON A.slide_id = B.id
+LEFT JOIN
+(SELECT video_version_id,MAX(id) as max_slide_id,MAX(slide_number) as max_slide_number FROM guidespark2_prod.video_slides GROUP BY video_version_id) C
+ON A.video_version_id=C.video_version_id
+WHERE A.type = 'PlaybackActivity' and A.is_preview = 'active' and A.parent_id IS NOT NULL and A.slide_id IS NOT NULL
+GROUP BY A.account_id,A.parent_id,A.trackable_id,A.video_version_id,A.created_at,A.slide_id;
+
+CREATE INDEX Icreated_at ON TMP_D2_PLOT (created_at);
+CREATE INDEX Iparent_id ON TMP_D2_PLOT (parent_id);
+
+################################################
+# Add Dummy slide to the end of each parent_id
+################################################
+CREATE TABLE sandbox_prod.TMP_D2_PLOT_DUMMY_SLIDE
+SELECT A.account_id,A.parent_id,A.session_id,A.user_id,A.video_id,A.video_version_id,
+		DATE_ADD(A.created_at,INTERVAL 1 SECOND) as created_at,NULL,title,(A.slide_id+1) as slide_id,
+		(A.slide_id+1) as slide_number,(A.slide_id+1) as max_slide_id,(A.slide_id+1) as max_slide_number 
+FROM sandbox_prod.TMP_D2_PLOT A
+RIGHT JOIN
+(SELECT parent_id,MAX(created_at) as created_at FROM guidespark2_prod.activities WHERE type = 'PlaybackActivity' and is_preview = 'active' GROUP BY account_id,parent_id,trackable_id,video_version_id ORDER BY parent_id) B
+ON A.parent_id=B.parent_id AND A.created_at=B.created_at
+WHERE video_id IS NOT NULL AND video_version_id IS NOT NULL
+GROUP BY account_id,parent_id,video_id,video_version_id;
+
+CREATE TABLE sandbox_prod.TMP_D2_PLOT_TOTAL
+(new_id2 BIGINT NOT NULL AUTO_INCREMENT,PRIMARY KEY my_pkey (new_id2))
+SELECT account_id,parent_id,session_id,user_id,video_id,video_version_id,created_at,client_action,title,slide_id,slide_number,max_slide_id,max_slide_number 
+FROM sandbox_prod.TMP_D2_PLOT
+union
+SELECT * FROM sandbox_prod.TMP_D2_PLOT_DUMMY_SLIDE
+ORDER BY account_id,parent_id,created_at;
+
+CREATE INDEX Iparent_id ON TMP_D2_PLOT_TOTAL (parent_id);
+CREATE INDEX Ivideo_version_id ON TMP_D2_PLOT_TOTAL (video_version_id);
+
+CREATE TABLE sandbox_prod.TMP_D2_PLOT_TOTAL_START
+SELECT A.* FROM TMP_D2_PLOT_TOTAL A
+LEFT JOIN
+(SELECT * FROM TMP_D2_PLOT_TOTAL where new_id2 IN (select min(new_id2) from TMP_D2_PLOT_TOTAL WHERE client_action IN ('_PLAY','_START') GROUP BY parent_id)) B
+ON A.parent_id=B.parent_id
+WHERE A.new_id2 >= B.new_id2;
+CREATE INDEX Inew_id2 ON TMP_D2_PLOT_TOTAL_START (new_id2);
+CREATE INDEX Iparent_id ON TMP_D2_PLOT_TOTAL_START (parent_id);
+CREATE INDEX Ivideo_version_id ON TMP_D2_PLOT_TOTAL_START (video_version_id);
+CREATE INDEX Islide_id ON TMP_D2_PLOT_TOTAL_START (slide_id);
+
+CREATE TABLE sandbox_prod.TMP_D2_PARENT_PATH
+(new_id3 BIGINT NOT NULL AUTO_INCREMENT,PRIMARY KEY my_pkey (new_id3))
+SELECT A.account_id,A.parent_id,A.session_id,A.user_id,A.video_id,A.video_version_id,
+		A.created_at,A.client_action,A.title,A.slide_id,A.slide_number,A.max_slide_id,A.max_slide_number FROM 
+sandbox_prod.TMP_D2_PLOT_TOTAL_START A 
+LEFT JOIN
+sandbox_prod.TMP_D2_PLOT_TOTAL_START B
+ON A.new_id2 = (B.new_id2-1) WHERE A.slide_id != B.slide_id AND A.parent_id = B.parent_id;
+
+CREATE TABLE sandbox_prod.TMP_D2_PARENT_PATH_wINCREMENT
+SELECT A.*,(A.new_id3-B.Nstart+1) as cur_slide FROM sandbox_prod.TMP_D2_PARENT_PATH A LEFT JOIN (select parent_id,MIN(new_id3) as Nstart FROM sandbox_prod.TMP_D2_PARENT_PATH GROUP BY parent_id) B ON A.parent_id=B.parent_id GROUP BY new_id3;
+
+CREATE INDEX Iparent_id ON sandbox_prod.TMP_D2_PARENT_PATH_wINCREMENT (parent_id);
+CREATE INDEX Isession_id ON sandbox_prod.TMP_D2_PARENT_PATH_wINCREMENT (session_id);
+CREATE INDEX Iuser_id ON sandbox_prod.TMP_D2_PARENT_PATH_wINCREMENT (user_id);
+
+### Calculate frequency of each chapter combo
+CREATE TABLE sandbox_prod.TMP_D2_PARENT_PLOT
+SELECT video_id,video_version_id,title,slide_number,cur_slide,COUNT(new_id3) as Ncount FROM sandbox_prod.TMP_D2_PARENT_PATH_wINCREMENT WHERE slide_number IS NOT NULL 
+GROUP BY video_id,video_version_id,slide_number,cur_slide ORDER BY video_id,video_version_id,slide_number,cur_slide;
+
+CREATE TABLE sandbox_prod.TMP_D2_PARENT_PLOT_1st
+SELECT video_id,video_version_id,title,slide_number,cur_slide,COUNT(new_id3) as Ncount 
+		FROM (SELECT * FROM sandbox_prod.TMP_D2_PARENT_PATH_wINCREMENT WHERE parent_id IN (
+			SELECT distinct parent_id FROM (
+			SELECT user_id,min(parent_id) as parent_id FROM sandbox_prod.TMP_D2_PARENT_PATH_wINCREMENT WHERE user_id IS NOT NULL GROUP BY user_id) T)) TT 
+		WHERE slide_number IS NOT NULL 
+		GROUP BY video_id,video_version_id,slide_number,cur_slide ORDER BY video_id,video_version_id,slide_number,cur_slide;
+
+### Calculate unique paths
+CREATE TABLE sandbox_prod.TMP_D2_UNIQUE_PATH
+SELECT account_id,video_id,video_version_id,slide_order,Nslide,COUNT(slide_order) as Nslide_order FROM ( 
+SELECT account_id,parent_id,session_id,user_id,video_id,video_version_id,
+		COUNT(slide_number) as Nslide,GROUP_CONCAT(slide_number) as slide_order 
+FROM sandbox_prod.TMP_D2_PARENT_PATH
+GROUP BY account_id,parent_id,video_id,video_version_id) T
+GROUP BY account_id,video_id,video_version_id,slide_order
+ORDER BY account_id,video_id,video_version_id,COUNT(slide_order) desc;
+
+##############################################################################
+# OE SEE LINK RATE ... how many will see the linked
+# 1) Total parent_ids
+# 2) OE parent_ids
+# 3) OE parent_ids with '_PLAYBACK_ENDED'
+# 4) Parent_IDs that reached the final slide (not necessarily completed)
+# 5) Parent_IDs that watched ALL slides (not necessary completed all slides)
+##############################################################################				
+#select COUNT(*),COUNT(*) FROM TMP_PARENT_G2
+#union
+#select COUNT(*),COUNT(*) FROM TMP_PARENT_G2 WHERE video_category IN ('OE')
+#union
+#select COUNT(*),COUNT(*) from guidespark2_prod.activities A INNER JOIN TMP_PARENT_G2 B ON A.parent_id=B.parent_id WHERE B.video_category IN ('OE') AND A.client_action IN ('_PLAYBACK_ENDED')
+#union
+#SELECT SUM(Ndrop),SUM(Nparent_total) FROM TMP_DROP_SLIDE_GLOBAL_MAXSLIDE A INNER JOIN guidespark2_prod.videos B ON A.video_id=B.id WHERE B.video_category IN ('OE')
+#union
+#SELECT SUM(parent_completeALL),SUM(Nparent_total) FROM TMP_COMPLETION_RATE WHERE video_category IN ('OE');						
+
+############################################
+# Daily Views ... NULL parent_id not include
+############################################
+#SELECT date1,LEFT(date1,3),COUNT(`parent_id`) as Nviews from (
+#SELECT CAST(MIN(created_at) as DATE) as date1,parent_id FROM guidespark2_prod.activities 
+#WHERE is_preview = 'active'
+#AND type IN ('PlaybackActivity') 
+#AND client_action IN ('_PLAY')
+#GROUP BY parent_id) T
+#WHERE date1 >= '2013-08-01' GROUP BY date1 ORDER BY date1 desc;
+
+CREATE TABLE sandbox_prod.TMP_VIEWING_HEATMAP_hour
+SELECT CONCAT(CAST(min_time as DATE),"-",LPAD(HOUR(min_time),2,'0')) as hour_time,WEEKDAY(min_time) as dayofweek,HOUR(min_time) as hour,COUNT(min_time) as Ncnt,MEDIAN(viewing_time_noPause) as median_viewing_time FROM TMP_PARENT_SUMMARY_nopause GROUP BY CONCAT(CAST(min_time as DATE),"-",LPAD(HOUR(min_time),2,'0')) ;
+
+CREATE TABLE sandbox_prod.TMP_VIEWING_HEATMAP_category
+SELECT video_category,WEEKDAY(min_time) as dayofweek,HOUR(min_time) as hour,COUNT(min_time) as Ncnt,MEDIAN(viewing_time_noPause) as median_viewing_time FROM TMP_PARENT_SUMMARY_nopause GROUP BY video_category,WEEKDAY(min_time),HOUR(min_time);
+
+#CREATE TABLE sandbox_prod.TMP_VIEWING_HEATMAP_category_tz
+#SELECT video_category,WEEKDAY(tz_local_time) as dayofweek,HOUR(tz_local_time) as hour,COUNT(tz_local_time) as Ncnt,MEDIAN(viewing_time_noPause) as median_viewing_time FROM TMP_PARENT_SUMMARY_nopause_NEW GROUP BY video_category,WEEKDAY(tz_local_time),HOUR(tz_local_time);
+
+#CREATE TABLE sandbox_prod.TMP_VIEWING_HEATMAP_industry_tz
+#SELECT industry_name,WEEKDAY(tz_local_time) as dayofweek,HOUR(tz_local_time) as hour,COUNT(tz_local_time) as Ncnt,MEDIAN(viewing_time_noPause) as median_viewing_time FROM TMP_PARENT_SUMMARY_nopause_NEW GROUP BY industry_name,WEEKDAY(tz_local_time),HOUR(tz_local_time);
+

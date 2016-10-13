@@ -1,0 +1,3 @@
+[update_edits_table.sh]: CURRENT DATE ... 2016-10-13
+[update_edits_table.sh]: RUN QC_sandbox_edits_20150724_v4.sql
+[update_edits_table.sh]: EXPORT CRITICAL TABLES

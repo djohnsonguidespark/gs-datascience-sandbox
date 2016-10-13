@@ -1,0 +1,4 @@
+[update_edits_table.sh]: RUN Attask_Hours_20150818.sql
+[update_edits_table.sh]: EXPORT CRITICAL TABLES
+[update_content_exec_table.sh]: WRITE TO SERVER
+[update_content_exec_table.sh]: UPDATE ATTASK TABLES

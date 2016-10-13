@@ -1,0 +1,52 @@
+#!/bin/sh
+
+DATETIME="$(date +'%Y-%m-%d')"
+
+echo "[update_benchmark_table.sh]: DELETE EXISTING TABLES / RECREATE TABLES"
+mysql -A -uroot  << eof
+CREATE DATABASE IF NOT EXISTS benchmark_prod;
+USE benchmark_prod;
+DROP TABLE IF EXISTS AER_GLOBAL_BENCHMARK_2014;
+DROP TABLE IF EXISTS AER_GLOBAL_BENCHMARK_2015;
+DROP TABLE IF EXISTS AER_PROGRAM_BENCHMARK_GS_ROW;
+DROP TABLE IF EXISTS AER_REACH_SUMMARY_DATEINTERVAL_account_benchmark;
+DROP TABLE IF EXISTS AER_REACH_SUMMARY_VIDEO_DATEINTERVAL_account_benchmark;
+DROP TABLE IF EXISTS AER_REACH_SUMMARY_DATEINTERVAL_account;
+DROP TABLE IF EXISTS AER_REACH_SUMMARY_DATEINTERVAL_account_OE2015;
+DROP TABLE IF EXISTS AER_REACH_SUMMARY_DATEINTERVAL_account_2014;
+DROP TABLE IF EXISTS AER_REACH_SUMMARY_DATEINTERVAL_WEEKLY_account;
+DROP TABLE IF EXISTS AER_REACH_SUMMARY_VIDEO_DATEINTERVAL_account;
+DROP TABLE IF EXISTS AER_REACH_SUMMARY_VIDEO_DATEINTERVAL_account_2014;
+DROP TABLE IF EXISTS AER_EFFECTIVENESS_SUMMARY_account_benchmark;
+DROP TABLE IF EXISTS AER_EFFECTIVENESS_SUMMARY_VIDEO_account_benchmark;
+DROP TABLE IF EXISTS TMP_AER_DAILY_account;
+DROP TABLE IF EXISTS TMP_AER_DAILY_account_solution;
+DROP TABLE IF EXISTS TMP_TARGET_AUDIENCE_date_range;
+DROP TABLE IF EXISTS TMP_EFFECTIVENESS_ALL;
+DROP TABLE IF EXISTS TMP_FURTHEST_POINT_SUMMARY;
+DROP TABLE IF EXISTS TMP_FURTHEST_POINT_parentid; 
+DROP TABLE IF EXISTS TMP_NSLIDE_VIEW; 
+DROP TABLE IF EXISTS TMP_NSLIDE_VIEW_GLOBAL;
+DROP TABLE IF EXISTS TMP_REACH_ALL;
+DROP TABLE IF EXISTS TMP_TEMP_ACCOUNTS; 
+source Production_Benchmarks_20150406.sql
+eof
+
+echo "[update_benchmark_table.sh]: RUN percentile.py"
+python percentile.py
+
+mysql -uroot << eof
+INSERT INTO benchmark_prod.AER_REACH_SUMMARY_DATEINTERVAL_account_benchmark VALUES ('','1-Year','2nd & Main',398,15000,12000,10000,'',10000,10000,'0-999',5,'04-09',0.30,0.36,'',77,71,'','','','','');
+INSERT INTO benchmark_prod.AER_EFFECTIVENESS_SUMMARY_account_benchmark VALUES ('','1-Year','2nd & Main',398,15000,'',10000,'0-999',5,'04-09',0.81,0.75,'',80,73,'','','','','');
+eof
+
+echo "[update_benchmark_table.sh]: RUN aer_daily_bm_calculation.py"
+python aer_daily_bm_calculation.py
+python aer_daily_bm_calculation_SOLUTION.py
+
+echo "[update_benchmark_table.sh]: RUN aer_daily_instance.py"
+python aer_daily_instance.py
+
+#sudo mysqldump -uroot benchmark_prod > ./backup_db/benchmark_prod.sql
+
+

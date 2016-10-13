@@ -1,0 +1,2 @@
+[update_aer_table.sh]: RUN G2_Benchmarks_PROD_20140820_G2query_v47.sql
+[update_aer_table.sh]: EXPORT CRITICAL TABLES
